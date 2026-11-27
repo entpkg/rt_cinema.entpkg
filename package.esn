@@ -1,0 +1,12 @@
+//! Real-time hardware ray-tracing, SHADER_F16, HiDPI-adaptive, and zero-asset
+//! procedural PBR rendering building blocks: zero-flicker raster TAA, capped
+//! half-res f16 GTAO + contact shadows, multi-mesh `native.trace@2` shadow and
+//! gaze-probe helpers, auto-mipmapped 16x anisotropic procedural PBR textures,
+//! 3D world wavefront/weather effects, and drop-in AgX filmic post-processing.
+package rt_cinema@1 { language = 1; ir = 1; }
+
+use "random.entpkg";
+use "geometry.entpkg";
+use "raster.entpkg";
+use "image.entpkg";
+use "kernels/";

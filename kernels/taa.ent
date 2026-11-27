@@ -1,0 +1,241 @@
+// Zero-Flicker Halton 8-Sample Raster TAA (`SHADER_F16`-friendly, HiDPI `scale()`-aware):
+//   - Unjittered pixel-center reprojection (`0.000 px` wobble when still!)
+//   - Camera-motion-gated depth disocclusion (eliminates 60Hz far-horizon silhouette strobing!)
+//   - Scene cut / instant-lighting-jump history reset via `cut_id: Rows<Int>` (zero dark ghost halos!)
+//   - Runtime toggle via key `T` (ASCII 84) or `taa_on = 0` param.
+use "geometry.entpkg";
+
+struct RtTaaState {
+    frame: Int;
+    jitter: Vec2;
+    enabled: Int;
+    prev_key: Int;
+    prev_cut: Int;
+}
+
+struct RtTaaMoments {
+    m1: Vec3;
+    m2: Vec3;
+}
+
+fn rt_halton_jitter(frame_idx: Int, amp: Float) -> Vec2 {
+    let k = frame_idx % 8;
+    let hx = if k == 0 {
+        0.5000
+    } else if k == 1 {
+        0.2500
+    } else if k == 2 {
+        0.7500
+    } else if k == 3 {
+        0.1250
+    } else if k == 4 {
+        0.6250
+    } else if k == 5 {
+        0.3750
+    } else if k == 6 {
+        0.8750
+    } else {
+        0.0625
+    };
+    let hy = if k == 0 {
+        0.3333
+    } else if k == 1 {
+        0.6667
+    } else if k == 2 {
+        0.1111
+    } else if k == 3 {
+        0.4444
+    } else if k == 4 {
+        0.7778
+    } else if k == 5 {
+        0.2222
+    } else if k == 6 {
+        0.5556
+    } else {
+        0.8889
+    };
+    return (vec2(hx, hy) - vec2(0.5, 0.5)) * amp;
+}
+
+fn rt_apply_clip_jitter(raw_clip: Vec4, jitter: Vec2, render_ext: Vec2) -> Vec4 {
+    let win = max(render_ext, vec2(1.0, 1.0));
+    return vec4(
+        raw_clip.x + jitter.x * (2.0 / win.x) * raw_clip.w,
+        raw_clip.y - jitter.y * (2.0 / win.y) * raw_clip.w,
+        raw_clip.z,
+        raw_clip.w
+    );
+}
+
+fn rt_hdr_luma(c: Vec3) -> Float {
+    return max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0);
+}
+
+fn rt_karis_in(c: Vec3) -> Vec3 {
+    return c / (1.0 + rt_hdr_luma(c));
+}
+
+fn rt_karis_out(c: Vec3) -> Vec3 {
+    let l = min(rt_hdr_luma(c), 0.992);
+    return c / max(1.0 - l, 0.008);
+}
+
+fn rt_rgb_to_ycocg(c: Vec3) -> Vec3 {
+    let y = 0.25 * c.x + 0.50 * c.y + 0.25 * c.z;
+    let co = 0.50 * c.x - 0.50 * c.z;
+    let cg = -0.25 * c.x + 0.50 * c.y - 0.25 * c.z;
+    return vec3(y, co, cg);
+}
+
+fn rt_ycocg_to_rgb(c: Vec3) -> Vec3 {
+    let tmp = c.x - c.z;
+    return vec3(tmp + c.y, c.x + c.z, tmp - c.y);
+}
+
+// Default constant cut ID (`0`) for scenes without instant camera/lighting cuts.
+kernel rt_cinema.cut_none@1 {
+    requires { field.write; }
+    output result: Rows<Int>;
+
+    compute {
+        return 0;
+    }
+}
+
+kernel rt_cinema.taa_start@1 {
+    requires { field.write; }
+    param taa_on: Int = 1;
+    output result: Rows<RtTaaState>;
+
+    compute {
+        return RtTaaState {
+            frame: 0,
+            jitter: vec2(0.0, 0.0),
+            enabled: taa_on,
+            prev_key: 0,
+            prev_cut: -1
+        };
+    }
+}
+
+kernel rt_cinema.taa_step@1 {
+    requires { field.read; field.write; input.read; }
+    input previous: Rows<RtTaaState>;
+    input cut_id: Rows<Int>;
+    param jitter_amp: Float = 0.68;
+    param toggle_key: Int = 84;
+    output result: Rows<RtTaaState>;
+
+    compute {
+        let prev = at(previous, 0);
+        let cur_cut = at(cut_id, 0);
+        let down = if toggle_key > 0 && key(toggle_key) { 1 } else { 0 };
+        let toggled = if down == 1 && prev.prev_key == 0 { 1 - prev.enabled } else { prev.enabled };
+        let instant_cut = prev.prev_cut >= 0 && cur_cut != prev.prev_cut;
+        let next_frame = if instant_cut { 1 } else { prev.frame + 1 };
+        let next_jitter = if toggled != 0 && next_frame >= 2 {
+            rt_halton_jitter(next_frame, jitter_amp)
+        } else {
+            vec2(0.0, 0.0)
+        };
+        return RtTaaState {
+            frame: next_frame,
+            jitter: next_jitter,
+            enabled: toggled,
+            prev_key: down,
+            prev_cut: cur_cut
+        };
+    }
+}
+
+kernel rt_cinema.taa_init@1 {
+    requires { field.write; }
+    output result: Image;
+
+    compute {
+        return vec4(0.0, 0.0, 0.0, -1.0);
+    }
+}
+
+// Accepts `Grid<Vec4 as f16>` linear HDR + distance-in-w (`current`) and resolves cleanly to `Image`.
+kernel rt_cinema.taa_resolve@1 {
+    requires { field.read; field.write; }
+    input current: Grid<Vec4 as f16>;
+    input history: Image;
+    input lens_cur: Rows<Lens>;
+    input lens_prev: Rows<Lens>;
+    input state: Rows<RtTaaState>;
+    param near: Float = 0.08;
+    param far: Float = 265.0;
+    param alpha_still: Float = 0.085;
+    param alpha_moving: Float = 0.36;
+    param gamma_still: Float = 1.65;
+    param gamma_moving: Float = 0.90;
+    output result: Image;
+
+    compute {
+        let q = coord();
+        let ext = size(current);
+        let cur = at(current, q);
+        let st = at(state, 0);
+
+        if st.enabled == 0 || st.frame <= 1 {
+            return cur;
+        }
+        let hist_ext = size(history);
+        if abs(hist_ext.x - ext.x) > 0.5 || abs(hist_ext.y - ext.y) > 0.5 {
+            return cur;
+        }
+
+        let l_cur = at(lens_cur, 0);
+        let l_prev = at(lens_prev, 0);
+        let dist = clamp(cur.w, near, far);
+        // Reproject from the UNJITTERED pixel center `q` so a stationary camera maps to exact `(q + 0.5)` with 0 wobble!
+        let dir = ray(l_cur, q, ext);
+        let world_p = l_cur.eye + dir * dist;
+        let prev_proj = project(l_prev, world_p, ext);
+
+        if prev_proj.z <= 0.01
+            || prev_proj.x < 1.0 || prev_proj.y < 1.0
+            || prev_proj.x >= ext.x - 1.0 || prev_proj.y >= ext.y - 1.0
+        {
+            return cur;
+        }
+
+        let hist_raw = at_linear(history, prev_proj.xy);
+        if hist_raw.w < 0.0 || isnan(hist_raw.x) || isnan(hist_raw.y) || isnan(hist_raw.z) {
+            return cur;
+        }
+
+        let mom = loop 9 with acc = RtTaaMoments { m1: vec3(0.0, 0.0, 0.0), m2: vec3(0.0, 0.0, 0.0) } {
+            let k = index();
+            let ox = float((k % 3) - 1);
+            let oy = float((k / 3) - 1);
+            let nq = clamp(q + vec2(ox, oy), vec2(0.0, 0.0), ext - vec2(1.0, 1.0));
+            let s_yc = rt_rgb_to_ycocg(rt_karis_in(max(at(current, nq).xyz, vec3(0.0, 0.0, 0.0))));
+            RtTaaMoments { m1: acc.m1 + s_yc, m2: acc.m2 + s_yc * s_yc }
+        };
+        let mean = mom.m1 / 9.0;
+        let var = max(mom.m2 / 9.0 - mean * mean, vec3(0.0, 0.0, 0.0));
+        let sigma = vec3(sqrt(var.x), sqrt(var.y), sqrt(var.z));
+
+        let motion_px = length(prev_proj.xy - (q + 0.5));
+        let motion_f = smoothstep(0.18, 4.0, motion_px);
+        // Gate depth disocclusion strictly by real camera motion to avoid 60Hz far-silhouette strobing when still!
+        let depth_jump = abs(hist_raw.w - dist) / max(dist, 0.5);
+        let disocc = smoothstep(0.14, 0.36, depth_jump) * smoothstep(0.15, 1.25, motion_px);
+
+        let box_gamma = mix(gamma_still, gamma_moving, motion_f);
+        let box_min = mean - sigma * box_gamma;
+        let box_max = mean + sigma * box_gamma;
+
+        let cur_yc = rt_rgb_to_ycocg(rt_karis_in(max(cur.xyz, vec3(0.0, 0.0, 0.0))));
+        let hist_yc = clamp(rt_rgb_to_ycocg(rt_karis_in(max(hist_raw.xyz, vec3(0.0, 0.0, 0.0)))), box_min, box_max);
+
+        let alpha = clamp(mix(alpha_still, alpha_moving, motion_f) + disocc * 0.60, alpha_still, 1.0);
+        let blended = rt_ycocg_to_rgb(mix(hist_yc, cur_yc, alpha));
+        let resolved = max(rt_karis_out(blended), vec3(0.0, 0.0, 0.0));
+        let next_dist = mix(hist_raw.w, dist, clamp(alpha * 2.0 + motion_f, 0.25, 1.0));
+        return vec4(resolved, next_dist);
+    }
+}

@@ -1,0 +1,172 @@
+// Reusable 3D World Wavefront (Genesis Bloom / Quantum Breach), 4-Layer Volumetric Cumulus Sky,
+// Sub-Pixel Pinpoint Starfield, Forked Storm Lightning, Wind-Slanted Rain & Raindrop Ripples!
+use "random.entpkg";
+use "geometry.entpkg";
+
+struct RtWaveSample {
+    blend: Float;     // 0.0 outside expanding sphere, 1.0 inside
+    ring: Float;      // Smooth leading wavefront envelope
+    topo_glow: Float; // Organic elevation contours, flat-surface ripples & glowing spore sparkles
+}
+
+fn rt_fbm2(p: Vec2, octaves: Int, seed: Int) -> Float {
+    let sum = loop octaves with s = vec4(0.0, 1.0, 0.0, 1.0) {
+        vec4(s.x + value2(p * s.w, seed + index()) * s.y, s.y * 0.5, s.z + s.y, s.w * 2.03)
+    };
+    return sum.x / max(sum.z, 0.0001);
+}
+
+// Smoothly gated 3D spherical world wavefront (zero hard cutoff seams on flat water or slopes!).
+fn rt_eval_world_wave(
+    world_pos: Vec3, n_geom: Vec3,
+    origin: Vec3, radius: Float, active: Float, t: Float
+) -> RtWaveSample {
+    let d_w = length(world_pos - origin);
+    let organic_warp = sin(world_pos.x * 0.45 + t * 2.5) * cos(world_pos.z * 0.45 - t * 2.1) * 0.85;
+    let d_eff = d_w + organic_warp;
+
+    let blend = if active > 0.005 {
+        smoothstep(radius + 2.4, radius - 2.6, d_eff)
+    } else {
+        1.0
+    };
+    let ring = if active > 0.005 {
+        exp(-abs(d_eff - radius) * 0.95) * active
+    } else {
+        0.0
+    };
+    let ring_env = smoothstep(0.02, 0.28, ring) * ring;
+    let topo_glow = if ring_env > 0.001 {
+        let is_slope = smoothstep(0.996, 0.92, abs(n_geom.y));
+        let elev_line = smoothstep(0.90, 0.992, abs(fract(world_pos.y * 2.15 + organic_warp * 0.08) - 0.5) * 2.0) * is_slope;
+        let flat_ring = smoothstep(0.84, 0.985, abs(fract(d_eff * 1.15) - 0.5) * 2.0) * (1.0 - is_slope);
+        let sp_p = world_pos * 2.35;
+        let sp_cell = floor(sp_p);
+        let sp_f = fract(sp_p) - vec3(0.5, 0.5, 0.5);
+        let cell_h = hash1(int(sp_cell.x) * 73 + int(sp_cell.y) * 193 + int(sp_cell.z) * 419, 991);
+        let spore_dot = smoothstep(0.24, 0.04, length(sp_f)) * smoothstep(0.62, 0.92, cell_h);
+        let sparkle = spore_dot * (0.45 + 0.55 * sin(t * 11.0 + cell_h * 22.0));
+        ring_env * (0.34 + elev_line * 1.15 + flat_ring * 0.85 + sparkle * 1.35)
+    } else {
+        0.0
+    };
+    return RtWaveSample { blend: blend, ring: ring, topo_glow: topo_glow };
+}
+
+// Crisp sub-pixel circular pinpoint starfield (zero square cells!).
+fn rt_eval_stars(dir: Vec3, t: Float, intensity: Float) -> Vec3 {
+    let up = clamp(dir.y, 0.0, 1.0);
+    if intensity <= 0.01 || up <= 0.06 {
+        return vec3(0.0, 0.0, 0.0);
+    }
+    let s_coord = dir.xz / max(up + 0.22, 0.10) * 215.0;
+    let s_cell = floor(s_coord);
+    let s_f = fract(s_coord) - vec2(0.5, 0.5);
+    let sh = hash1(int(s_cell.x) * 371 + int(s_cell.y) * 919, 977);
+    let sh2 = hash1(int(s_cell.x) * 613 + int(s_cell.y) * 277, 983);
+    let star_off = vec2(sh - 0.5, sh2 - 0.5) * 0.52;
+    let star_disc = smoothstep(0.22, 0.025, length(s_f - star_off));
+    let tw = 0.58 + 0.42 * sin(t * 2.6 + sh * 42.0);
+    let star_tint = mix(vec3(0.80, 0.92, 1.32), vec3(1.25, 1.05, 0.85), sh2);
+    return star_tint * (smoothstep(0.962, 0.996, sh) * star_disc * tw * smoothstep(0.06, 0.34, up) * 3.8 * intensity);
+}
+
+// Fast 4-layer volumetric cumulus sky dome with sun/moon disk & horizon haze blend.
+fn rt_eval_volumetric_sky(
+    dir: Vec3, sun_dir: Vec3,
+    sky_horizon: Vec3, sky_zenith: Vec3,
+    cloud_dark: Vec3, cloud_lit: Vec3,
+    cover_bias: Float, wind_speed: Float, star_intensity: Float, t: Float
+) -> Vec3 {
+    let up = clamp(dir.y, 0.0, 1.0);
+    let mu = max(dot(dir, sun_dir), 0.0);
+    let base_sky = mix(sky_horizon, sky_zenith, pow(max(up, 0.0001), 0.52))
+        + cloud_lit * (0.45 * pow(max(mu, 0.0001), 18.0) + 3.2 * smoothstep(0.997, 0.9995, mu));
+    let stars = rt_eval_stars(dir, t, star_intensity);
+
+    let inv_y = 1.0 / max(up + 0.12, 0.12);
+    let wind_v = vec2(t * wind_speed, -t * wind_speed * 0.55);
+    let sun_xz = normalize(vec2(sun_dir.x, sun_dir.z) + vec2(0.0001, 0.0));
+
+    let vol_c = loop 4 with acc = vec4(0.0, 0.0, 0.0, 1.0) {
+        let k = index();
+        let h_u = (float(k) + 0.5) / 4.0;
+        let alt = mix(0.45, 1.05, h_u);
+        let p_c = dir.xz * (alt * inv_y * 0.52) + wind_v * (1.0 + h_u * 0.6);
+        let n1 = rt_fbm2(p_c, 2, 701 + k * 7);
+        let n2 = value2(p_c * 2.8 + vec2(3.1, -1.7), 719);
+        let prof = sin(h_u * 3.14159);
+        let dens = smoothstep(0.06, 0.56, n1 * 0.72 + n2 * 0.28 + cover_bias) * prof;
+        let n_sun = value2(p_c + sun_xz * 0.14, 701 + k * 7);
+        let lit_f = clamp(0.22 + h_u * 0.62 + (n1 - n_sun) * 0.85, 0.0, 1.0);
+        let col_l = mix(cloud_dark, cloud_lit, lit_f);
+        let alpha = clamp(dens * 0.56 * smoothstep(0.01, 0.18, up), 0.0, 0.88);
+        vec4(acc.xyz + col_l * (alpha * acc.w), acc.w * (1.0 - alpha))
+    };
+
+    let sky_plus = (base_sky + stars) * vol_c.w + vol_c.xyz;
+    let inv_u = 1.0 - up;
+    let inv_u2 = inv_u * inv_u;
+    return mix(sky_plus, sky_horizon, (inv_u2 * inv_u2 * inv_u) * 0.65);
+}
+
+// Forked sky lightning bolt slicing down through storm clouds.
+fn rt_eval_lightning(dir: Vec3, bolt_dir: Vec3, flash: Float, bolt_seed: Int) -> Vec3 {
+    if flash <= 0.015 || dir.y < 0.02 || dot(dir, bolt_dir) < 0.25 {
+        return vec3(0.0, 0.0, 0.0);
+    }
+    let ang_x = dir.x / max(abs(dir.z), 0.12) - bolt_dir.x / max(abs(bolt_dir.z), 0.12);
+    let y = clamp(dir.y, 0.0, 0.95);
+    let z1 = (value2(vec2(y * 12.0, float(bolt_seed) * 1.9), 863) - 0.5) * 0.13;
+    let z2 = (value2(vec2(y * 34.0 + 3.1, float(bolt_seed) * 3.7), 877) - 0.5) * 0.045;
+    let d_main = abs(ang_x - (z1 + z2));
+    let y_gate = smoothstep(0.04, 0.12, y) * smoothstep(0.68, 0.40, y);
+
+    let core = exp(-d_main * 190.0) * 28.0 + exp(-d_main * 36.0) * 3.6;
+    let fork_ang = ang_x - (z1 + (y - 0.30) * 0.44 + z2 * 0.8);
+    let fork_gate = smoothstep(0.32, 0.25, y) * smoothstep(0.06, 0.15, y);
+    let fork = (exp(-abs(fork_ang) * 220.0) * 14.0 + exp(-abs(fork_ang) * 42.0) * 2.0) * fork_gate;
+
+    let cloud_burst = exp(-length(dir - bolt_dir) * 3.6) * 4.2;
+    return (vec3(1.15, 1.32, 1.85) * (core + fork) * y_gate + vec3(0.55, 0.72, 1.20) * cloud_burst) * flash;
+}
+
+// Wind-slanted rain streaks illuminated by sky & lightning flash.
+fn rt_eval_rain_glint(q: Vec2, ext: Vec2, dist: Float, t: Float, intensity: Float, flash: Float) -> Vec3 {
+    if intensity <= 0.02 {
+        return vec3(0.0, 0.0, 0.0);
+    }
+    let uv = q / max(ext, vec2(1.0, 1.0));
+    let s1 = vec2(uv.x * 155.0 + uv.y * 16.0, uv.y * 9.5 - t * 7.4);
+    let h1 = hash1(int(floor(s1.x)) * 197 + int(floor(s1.y)) * 53, 811);
+    let d1 = if h1 > 0.952 && dist > 1.8 {
+        smoothstep(0.095, 0.012, abs(fract(s1.x) - 0.5)) * smoothstep(0.0, 0.25, fract(s1.y)) * smoothstep(1.0, 0.35, fract(s1.y)) * (h1 - 0.952) * 24.0
+    } else {
+        0.0
+    };
+    let s2 = vec2(uv.x * 265.0 + uv.y * 24.0 + 13.7, uv.y * 15.0 - t * 5.6);
+    let h2 = hash1(int(floor(s2.x)) * 251 + int(floor(s2.y)) * 89, 823);
+    let d2 = if h2 > 0.948 && dist > 4.5 {
+        smoothstep(0.11, 0.02, abs(fract(s2.x) - 0.5)) * smoothstep(0.0, 0.25, fract(s2.y)) * smoothstep(1.0, 0.30, fract(s2.y)) * (h2 - 0.948) * 18.0
+    } else {
+        0.0
+    };
+    let glint = (d1 * 0.28 + d2 * 0.16) * intensity * smoothstep(1.4, 8.0, dist);
+    return mix(vec3(0.62, 0.72, 0.85), vec3(1.85, 2.25, 3.00), saturate(flash * 1.2)) * (glint * (1.0 + flash * 2.4));
+}
+
+// Concentric physical raindrop splash ripples for water or wet puddles.
+fn rt_eval_rain_ripples(xz: Vec2, t: Float, intensity: Float) -> Float {
+    if intensity <= 0.02 {
+        return 0.0;
+    }
+    let cell = floor(xz * 2.4);
+    let f = fract(xz * 2.4);
+    let h1 = hash1(int(cell.x) * 193 + int(cell.y) * 571, 881);
+    let h2 = hash1(int(cell.x) * 317 + int(cell.y) * 733, 883);
+    let ph = fract(t * (1.35 + h1 * 0.85) + h2 * 7.3);
+    let ctr = vec2(0.22 + h1 * 0.56, 0.22 + h2 * 0.56);
+    let d = length(f - ctr);
+    let r = ph * 0.48;
+    return sin((d - r) * 38.0) * exp(-abs(d - r) * 18.0) * (1.0 - ph) * intensity * 0.55;
+}

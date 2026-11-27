@@ -1,0 +1,471 @@
+// Zero-Asset Auto-Mipmap 16x Hardware Anisotropic Procedural PBR Texture Library!
+// Generates 1024x1024 seamless `Grid<Vec4 as unorm8>` (albedo + roughness) and `Grid<Vec2 as unorm8>`
+// (tangent normal) maps ONCE on GPU Frame 0 (`0 bytes` on disk!). Sampling with 4-arg
+// `at_repeat(tex, uv * sz, ddx * sz, ddy * sz)` (or 3-arg `lod`) automatically builds full GPU
+// mipmap chains + 16x hardware anisotropic filtering!
+//
+// `kind` parameter:
+//   0 = Chiseled River Granite (Nature / Cliffs / Boulders)
+//   1 = Ancient European Oak & Woodland Bark
+//   2 = Damp Woodland Floor, Velvet Moss & Leaf Litter
+//   3 = Board-Formed Brutalist Architectural Concrete (Formwork Boards, Tie-Rod Dimples & Pores)
+//   4 = Riveted Battleship Cyber-Steel Armor (Interlocked Plates, Rivets, Ribs & Oxide Streaks)
+//   5 = Honed Dark Basalt Ashlar Paving (4x4 Staggered Stone Slabs, Mortar Joints & Mineral Veins)
+//   6 = 30X Cold-Rolled Brushed Stainless Steel (Aerospace Panel Gaps & Corner Fasteners)
+use "random.entpkg";
+use "geometry.entpkg";
+use "gtao.ent";
+
+struct RtFootprint {
+    p_dx: Vec3;
+    p_dy: Vec3;
+}
+
+fn rt_compute_footprint(
+    l: Lens, q: Vec2, jitter: Vec2, ext: Vec2,
+    world_pos: Vec3, n_geom: Vec3, dir: Vec3, dist: Float, near: Float, far: Float
+) -> RtFootprint {
+    let rel = world_pos - l.eye;
+    let numer = dot(rel, n_geom);
+    let rx = ray(l, q + vec2(1.0, 0.0) - jitter, ext);
+    let ry = ray(l, q + vec2(0.0, 1.0) - jitter, ext);
+    let dx_d = dot(rx, n_geom);
+    let dy_d = dot(ry, n_geom);
+    let p_dx = if abs(dx_d) > 0.04 {
+        l.eye + rx * clamp(numer / dx_d, near, far) - world_pos
+    } else {
+        (rx - dir) * dist
+    };
+    let p_dy = if abs(dy_d) > 0.04 {
+        l.eye + ry * clamp(numer / dy_d, near, far) - world_pos
+    } else {
+        (ry - dir) * dist
+    };
+    return RtFootprint { p_dx: p_dx, p_dy: p_dy };
+}
+
+fn rt_box_uv(world_pos: Vec3, n_geom: Vec3, scale_f: Float) -> Vec2 {
+    let an = abs(n_geom);
+    if an.y >= an.x && an.y >= an.z {
+        return world_pos.xz * scale_f;
+    }
+    if an.x >= an.z {
+        return vec2(world_pos.z, world_pos.y) * scale_f;
+    }
+    return vec2(world_pos.x, world_pos.y) * scale_f;
+}
+
+fn rt_box_duv(dp: Vec3, n_geom: Vec3, scale_f: Float) -> Vec2 {
+    let an = abs(n_geom);
+    if an.y >= an.x && an.y >= an.z {
+        return dp.xz * scale_f;
+    }
+    if an.x >= an.z {
+        return vec2(dp.z, dp.y) * scale_f;
+    }
+    return vec2(dp.x, dp.y) * scale_f;
+}
+
+fn rt_unpack_normal(n_xy: Vec2, strength: Float) -> Vec3 {
+    let nx = (n_xy.x * 2.0 - 1.0) * strength;
+    let ny = (n_xy.y * 2.0 - 1.0) * strength;
+    let nz = sqrt(max(1.0 - clamp(nx * nx + ny * ny, 0.0, 0.96), 0.04));
+    return vec3(nx, ny, nz);
+}
+
+fn rt_apply_tangent_normal(n_geom: Vec3, tn: Vec3) -> Vec3 {
+    let ref_u = if abs(n_geom.y) > 0.92 { vec3(1.0, 0.0, 0.0) } else { vec3(0.0, 1.0, 0.0) };
+    let t_ax = rt_safe_norm(cross(ref_u, n_geom), vec3(1.0, 0.0, 0.0));
+    let b_ax = cross(n_geom, t_ax);
+    return rt_safe_norm(t_ax * tn.x + b_ax * tn.y + n_geom * tn.z, n_geom);
+}
+
+fn rt_pbr_hash(ix: Int, iy: Int, period: Int, seed: Int) -> Float {
+    let wx = ((ix % period) + period) % period;
+    let wy = ((iy % period) + period) % period;
+    return hash1(wx * 374761 + wy * 668265 + seed * 127, 911);
+}
+
+fn rt_pbr_val(uv: Vec2, freq: Int, seed: Int) -> Float {
+    let px = uv.x * float(freq);
+    let py = uv.y * float(freq);
+    let ix = int(floor(px));
+    let iy = int(floor(py));
+    let fx = px - floor(px);
+    let fy = py - floor(py);
+    let ux = fx * fx * (3.0 - 2.0 * fx);
+    let uy = fy * fy * (3.0 - 2.0 * fy);
+    let a = rt_pbr_hash(ix, iy, freq, seed);
+    let b = rt_pbr_hash(ix + 1, iy, freq, seed);
+    let c = rt_pbr_hash(ix, iy + 1, freq, seed);
+    let d = rt_pbr_hash(ix + 1, iy + 1, freq, seed);
+    return mix(mix(a, b, ux), mix(c, d, ux), uy);
+}
+
+fn rt_pbr_fbm(uv: Vec2, base_freq: Int, seed: Int) -> Float {
+    let v0 = rt_pbr_val(uv, base_freq, seed);
+    let v1 = rt_pbr_val(uv, base_freq * 2, seed + 13);
+    let v2 = rt_pbr_val(uv, base_freq * 4, seed + 29);
+    let v3 = rt_pbr_val(uv, base_freq * 8, seed + 53);
+    return v0 * 0.50 + v1 * 0.27 + v2 * 0.15 + v3 * 0.08;
+}
+
+fn rt_pbr_ridged(uv: Vec2, base_freq: Int, seed: Int) -> Float {
+    let r0 = 1.0 - abs(rt_pbr_val(uv, base_freq, seed) * 2.0 - 1.0);
+    let r1 = 1.0 - abs(rt_pbr_val(uv, base_freq * 2, seed + 19) * 2.0 - 1.0);
+    let r2 = 1.0 - abs(rt_pbr_val(uv, base_freq * 4, seed + 37) * 2.0 - 1.0);
+    let r3 = 1.0 - abs(rt_pbr_val(uv, base_freq * 8, seed + 71) * 2.0 - 1.0);
+    return r0 * r0 * 0.48 + r1 * r1 * 0.28 + r2 * r2 * 0.16 + r3 * r3 * 0.08;
+}
+
+// ----------------------------------------------------------------------------
+// 0. Chiseled River Granite
+// ----------------------------------------------------------------------------
+fn rt_granite_h(uv: Vec2) -> Float {
+    let warp = vec2(rt_pbr_fbm(uv, 4, 101) - 0.5, rt_pbr_fbm(uv + vec2(0.37, 0.71), 4, 107) - 0.5) * 0.08;
+    let u = fract(uv + warp);
+    let strata = abs(sin((u.x * 2.0 + u.y * 4.0) * 3.14159 + rt_pbr_val(u, 4, 113) * 2.4));
+    let frac_big = rt_pbr_ridged(u, 6, 127);
+    let frac_fine = rt_pbr_ridged(u, 16, 139);
+    let grit = rt_pbr_val(uv, 64, 149) * 0.65 + rt_pbr_val(uv, 128, 157) * 0.35;
+    let crack = smoothstep(0.84, 0.96, rt_pbr_ridged(u, 8, 163));
+    return clamp(strata * 0.26 + frac_big * 0.42 + frac_fine * 0.22 + grit * 0.10 - crack * 0.34, 0.0, 1.0);
+}
+
+fn rt_granite_alb(uv: Vec2) -> Vec4 {
+    let h = rt_granite_h(uv);
+    let macro_v = rt_pbr_fbm(uv, 4, 173);
+    let speck = rt_pbr_val(uv, 64, 179) * 0.6 + rt_pbr_val(uv, 128, 181) * 0.4;
+    let quartz = smoothstep(0.74, 0.90, rt_pbr_ridged(uv, 10, 191));
+    let rust = smoothstep(0.54, 0.80, rt_pbr_fbm(uv + vec2(0.2, 0.6), 4, 197));
+    let moss_pocket = smoothstep(0.58, 0.82, rt_pbr_fbm(uv + vec2(0.7, 0.1), 6, 211)) * smoothstep(0.55, 0.22, h);
+
+    let base = mix(vec3(0.14, 0.148, 0.140), vec3(0.38, 0.372, 0.342), clamp(h * 0.62 + macro_v * 0.24 + speck * 0.20, 0.0, 1.0));
+    let with_q = mix(base, vec3(0.64, 0.63, 0.59), quartz * 0.42);
+    let with_r = mix(with_q, vec3(0.36, 0.27, 0.18), rust * 0.30);
+    let with_m = mix(with_r, vec3(0.082, 0.148, 0.042), moss_pocket * 0.58);
+    let ao = mix(0.45, 1.08, smoothstep(0.10, 0.68, h));
+    let rough = clamp(0.78 - quartz * 0.22 - speck * 0.08 + moss_pocket * 0.14, 0.36, 0.94);
+    return vec4(clamp(with_m * ao, vec3(0.02, 0.02, 0.02), vec3(0.95, 0.95, 0.95)), rough);
+}
+
+// ----------------------------------------------------------------------------
+// 1. Ancient European Oak & Woodland Bark
+// ----------------------------------------------------------------------------
+fn rt_bark_h(uv: Vec2) -> Float {
+    let warp_x = (rt_pbr_fbm(uv, 4, 307) - 0.5) * 0.075;
+    let u = vec2(fract(uv.x + warp_x), uv.y);
+    let ridge_a = 1.0 - abs(rt_pbr_val(u, 16, 311) * 2.0 - 1.0);
+    let ridge_b = 1.0 - abs(rt_pbr_val(vec2(fract(u.x * 2.0), u.y), 16, 317) * 2.0 - 1.0);
+    let plate = rt_pbr_val(vec2(u.x, fract(u.y * 0.5)), 8, 331);
+    let cross_split = smoothstep(0.78, 0.94, rt_pbr_val(u, 32, 337));
+    let fiber = rt_pbr_val(u, 64, 347);
+    return clamp(ridge_a * ridge_a * 0.46 + ridge_b * 0.24 + plate * 0.22 + fiber * 0.08 - cross_split * 0.22, 0.0, 1.0);
+}
+
+fn rt_bark_alb(uv: Vec2) -> Vec4 {
+    let h = rt_bark_h(uv);
+    let plate_var = rt_pbr_fbm(uv, 6, 353);
+    let lichen = smoothstep(0.68, 0.86, rt_pbr_fbm(uv + vec2(0.41, 0.19), 8, 359)) * smoothstep(0.35, 0.72, h);
+    let moss = smoothstep(0.60, 0.82, rt_pbr_fbm(uv + vec2(0.13, 0.67), 6, 367)) * smoothstep(0.52, 0.16, h);
+
+    let ridge_col = mix(vec3(0.145, 0.128, 0.104), vec3(0.215, 0.192, 0.158), plate_var);
+    let base = mix(vec3(0.038, 0.032, 0.025), ridge_col, smoothstep(0.14, 0.74, h));
+    let with_m = mix(base, vec3(0.068, 0.135, 0.036), moss * 0.68);
+    let with_l = mix(with_m, vec3(0.29, 0.32, 0.25), lichen * 0.52);
+    let rough = clamp(0.88 - h * 0.12 + moss * 0.08, 0.62, 0.96);
+    return vec4(clamp(with_l, vec3(0.02, 0.02, 0.02), vec3(0.95, 0.95, 0.95)), rough);
+}
+
+// ----------------------------------------------------------------------------
+// 2. Damp Woodland Floor, Velvet Moss & Leaf Litter
+// ----------------------------------------------------------------------------
+fn rt_floor_h(uv: Vec2) -> Float {
+    let mound = rt_pbr_fbm(uv, 6, 503);
+    let turf = rt_pbr_fbm(uv, 24, 509);
+    let pebble = smoothstep(0.68, 0.88, rt_pbr_ridged(uv, 16, 521));
+    let leaf = smoothstep(0.72, 0.90, rt_pbr_val(uv, 32, 541));
+    return clamp(mound * 0.45 + turf * 0.28 + pebble * 0.18 + leaf * 0.09, 0.0, 1.0);
+}
+
+fn rt_floor_alb(uv: Vec2) -> Vec4 {
+    let h = rt_floor_h(uv);
+    let humus_m = rt_pbr_fbm(uv, 6, 547);
+    let moss_m = smoothstep(0.42, 0.76, rt_pbr_fbm(uv + vec2(0.31, 0.59), 8, 557));
+    let leaf_m = smoothstep(0.70, 0.88, rt_pbr_val(uv, 28, 563));
+    let pebble_m = smoothstep(0.74, 0.90, rt_pbr_ridged(uv, 16, 521));
+
+    let olive_turf = mix(vec3(0.085, 0.152, 0.038), vec3(0.168, 0.228, 0.062), humus_m);
+    let base = mix(vec3(0.055, 0.050, 0.034), olive_turf, smoothstep(0.24, 0.74, humus_m * 0.55 + moss_m * 0.45));
+    let with_leaf = mix(base, vec3(0.20, 0.125, 0.058), leaf_m * 0.55);
+    let with_peb = mix(with_leaf, vec3(0.24, 0.235, 0.215), pebble_m * 0.45);
+    let rough = clamp(0.84 - pebble_m * 0.26 + leaf_m * 0.06, 0.48, 0.95);
+    return vec4(clamp(with_peb * mix(0.72, 1.08, h), vec3(0.02, 0.02, 0.02), vec3(0.95, 0.95, 0.95)), rough);
+}
+
+// ----------------------------------------------------------------------------
+// 3. Board-Formed Brutalist Architectural Concrete
+//    8 timber formwork boards, staggered vertical joints, micro tie-rod dimples,
+//    wood-grain imprint, aggregate pores & rain weathering patina.
+// ----------------------------------------------------------------------------
+fn rt_concrete_h(uv: Vec2) -> Float {
+    let rows = 8.0;
+    let r_id = int(floor(uv.y * rows));
+    let rv = fract(uv.y * rows);
+    let u_off = if (r_id & 1) == 0 { 0.0 } else { 0.5 };
+    let u_shift = fract(uv.x + u_off);
+    let c_id = int(floor(u_shift * 2.0));
+    let ru = fract(u_shift * 2.0);
+
+    let board_h = (rt_pbr_hash(c_id, r_id, 8, 101) - 0.5) * 0.14;
+    let j_y = smoothstep(0.0, 0.055, rv) * smoothstep(0.0, 0.055, 1.0 - rv);
+    let j_x = smoothstep(0.0, 0.018, ru) * smoothstep(0.0, 0.018, 1.0 - ru);
+    let joint = mix(0.18, 1.0, min(j_x, j_y));
+
+    let hole_u = if ru < 0.5 { ru - 0.25 } else { ru - 0.75 };
+    let hole_d = length(vec2(hole_u * 2.0, (rv - 0.5) * 0.5));
+    let hole = smoothstep(0.014, 0.032, hole_d);
+
+    let grain = rt_pbr_fbm(vec2(uv.x, fract(uv.y * 6.0 + float(r_id) * 0.17)), 8, 107);
+    let pores = rt_pbr_fbm(uv, 32, 113);
+    let pitting = smoothstep(0.28, 0.42, rt_pbr_val(uv, 64, 127));
+
+    return clamp(0.55 + board_h + (joint - 1.0) * 0.30 + (hole - 1.0) * 0.16 + (grain - 0.5) * 0.18 + (pores - 0.5) * 0.12 + (pitting - 1.0) * 0.08, 0.0, 1.0);
+}
+
+fn rt_concrete_alb(uv: Vec2) -> Vec4 {
+    let rows = 8.0;
+    let r_id = int(floor(uv.y * rows));
+    let rv = fract(uv.y * rows);
+    let u_off = if (r_id & 1) == 0 { 0.0 } else { 0.5 };
+    let u_shift = fract(uv.x + u_off);
+    let c_id = int(floor(u_shift * 2.0));
+    let ru = fract(u_shift * 2.0);
+
+    let board_tint = rt_pbr_hash(c_id, r_id, 8, 131);
+    let j_y = smoothstep(0.0, 0.048, rv) * smoothstep(0.0, 0.048, 1.0 - rv);
+    let j_x = smoothstep(0.0, 0.015, ru) * smoothstep(0.0, 0.015, 1.0 - ru);
+    let seam_ao = mix(0.62, 1.0, min(j_x, j_y));
+
+    let hole_u = if ru < 0.5 { ru - 0.25 } else { ru - 0.75 };
+    let hole_d = length(vec2(hole_u * 2.0, (rv - 0.5) * 0.5));
+    let hole_ao = mix(0.76, 1.0, smoothstep(0.012, 0.028, hole_d));
+    let grain = rt_pbr_fbm(vec2(uv.x, fract(uv.y * 6.0 + float(r_id) * 0.17)), 8, 107);
+    let macro_w = rt_pbr_fbm(vec2(fract(uv.x * 2.0), uv.y), 4, 137);
+    let fine = rt_pbr_fbm(uv, 32, 113);
+    let rain = 0.82 + 0.18 * rt_pbr_fbm(vec2(fract(uv.x * 4.0), fract(uv.y * 0.5)), 8, 149);
+
+    let base_l = (0.64 + (board_tint - 0.5) * 0.14 + (grain - 0.5) * 0.14 + (macro_w - 0.5) * 0.18 + (fine - 0.5) * 0.09) * seam_ao * hole_ao * rain;
+    let rgb = vec3(base_l * 1.01, base_l * 1.00, base_l * 0.97);
+    let rough = clamp(0.66 + (1.0 - seam_ao) * 0.22 + (0.5 - macro_w) * 0.18 + (0.5 - fine) * 0.14, 0.42, 0.96);
+    return vec4(saturate(rgb.x), saturate(rgb.y), saturate(rgb.z), rough);
+}
+
+// ----------------------------------------------------------------------------
+// 4. Riveted Battleship Cyber-Steel Armor Plating
+//    Interlocked steel plates, beveled weld seams, hemispherical perimeter
+//    rivets, inspection stiffener ribs, mill grain & vertical oxide streaks.
+// ----------------------------------------------------------------------------
+fn rt_steel_h(uv: Vec2) -> Float {
+    let rows = 4.0;
+    let r_id = int(floor(uv.y * rows));
+    let rv = fract(uv.y * rows);
+    let u_off = if (r_id & 1) == 0 { 0.0 } else { 0.25 };
+    let u_shift = fract(uv.x + u_off);
+    let c_id = int(floor(u_shift * 2.0));
+    let ru = fract(u_shift * 2.0);
+
+    let plate_h = (rt_pbr_hash(c_id, r_id, 8, 307) - 0.5) * 0.10;
+    let j_x = smoothstep(0.0, 0.022, ru) * smoothstep(0.0, 0.022, 1.0 - ru);
+    let j_y = smoothstep(0.0, 0.036, rv) * smoothstep(0.0, 0.036, 1.0 - rv);
+    let seam = min(j_x, j_y);
+
+    let riv_u = fract(ru * 8.0) - 0.5;
+    let d_rt = length(vec2(riv_u, (rv - 0.88) * 4.0));
+    let d_rb = length(vec2(riv_u, (rv - 0.12) * 4.0));
+    let rivet_bump = smoothstep(0.22, 0.04, min(d_rt, d_rb)) * 0.24 * smoothstep(0.03, 0.06, ru) * smoothstep(0.03, 0.06, 1.0 - ru);
+    let rib = smoothstep(0.07, 0.015, abs(rv - 0.50)) * 0.09 * smoothstep(0.04, 0.08, ru) * smoothstep(0.04, 0.08, 1.0 - ru);
+
+    let mill = rt_pbr_fbm(vec2(fract(uv.x * 2.0), fract(uv.y * 8.0)), 8, 313);
+    let pit = rt_pbr_fbm(uv, 32, 317);
+
+    return clamp(0.52 + plate_h + (seam - 1.0) * 0.42 + rivet_bump + rib + (mill - 0.5) * 0.08 + (pit - 0.5) * 0.07, 0.0, 1.0);
+}
+
+fn rt_steel_alb(uv: Vec2) -> Vec4 {
+    let rows = 4.0;
+    let r_id = int(floor(uv.y * rows));
+    let rv = fract(uv.y * rows);
+    let u_off = if (r_id & 1) == 0 { 0.0 } else { 0.25 };
+    let u_shift = fract(uv.x + u_off);
+    let c_id = int(floor(u_shift * 2.0));
+    let ru = fract(u_shift * 2.0);
+
+    let plate_t = rt_pbr_hash(c_id, r_id, 8, 331);
+    let j_x = smoothstep(0.0, 0.022, ru) * smoothstep(0.0, 0.022, 1.0 - ru);
+    let j_y = smoothstep(0.0, 0.036, rv) * smoothstep(0.0, 0.036, 1.0 - rv);
+    let seam = min(j_x, j_y);
+    let edge_wear = smoothstep(0.07, 0.022, min(min(ru, 1.0 - ru), min(rv * 0.6, (1.0 - rv) * 0.6))) * seam;
+
+    let riv_u = fract(ru * 8.0) - 0.5;
+    let d_rt = length(vec2(riv_u, (rv - 0.88) * 4.0));
+    let d_rb = length(vec2(riv_u, (rv - 0.12) * 4.0));
+    let rivet_hi = smoothstep(0.18, 0.04, min(d_rt, d_rb)) * 0.18;
+    let rust_streak_m = smoothstep(0.16, 0.0, abs(riv_u)) * smoothstep(0.88, 0.40, rv) * smoothstep(0.25, 0.84, rv) * rt_pbr_val(uv, 16, 337);
+
+    let mill = rt_pbr_fbm(vec2(fract(uv.x * 2.0), fract(uv.y * 8.0)), 8, 313);
+    let grime = rt_pbr_fbm(vec2(fract(uv.x * 4.0), uv.y), 8, 347);
+    let base_l = (0.50 + (plate_t - 0.5) * 0.16 + (mill - 0.5) * 0.10 + (grime - 0.5) * 0.14 + edge_wear * 0.18 + rivet_hi) * mix(0.28, 1.0, seam);
+
+    let steel = vec3(base_l * 0.94, base_l * 0.98, base_l * 1.05);
+    let rust = vec3(0.42, 0.21, 0.12) * (0.7 + 0.3 * grime);
+    let rgb = mix(steel, rust, clamp(rust_streak_m * 0.65, 0.0, 0.55));
+    let rough = clamp(0.46 + (1.0 - seam) * 0.34 + rust_streak_m * 0.28 - edge_wear * 0.22 + (0.5 - mill) * 0.12, 0.22, 0.94);
+    return vec4(saturate(rgb.x), saturate(rgb.y), saturate(rgb.z), rough);
+}
+
+// ----------------------------------------------------------------------------
+// 5. Honed Dark Basalt & Architectural Ashlar Plaza Paving
+// ----------------------------------------------------------------------------
+fn rt_basalt_h(uv: Vec2) -> Float {
+    let rows = 4.0;
+    let r_id = int(floor(uv.y * rows));
+    let rv = fract(uv.y * rows);
+    let u_off = float(r_id % 2) * 0.125;
+    let u_shift = fract(uv.x + u_off);
+    let c_id = int(floor(u_shift * 4.0));
+    let ru = fract(u_shift * 4.0);
+
+    let slab_h = (rt_pbr_hash(c_id, r_id, 4, 201) - 0.5) * 0.06;
+    let j_x = smoothstep(0.0, 0.028, ru) * smoothstep(0.0, 0.028, 1.0 - ru);
+    let j_y = smoothstep(0.0, 0.028, rv) * smoothstep(0.0, 0.028, 1.0 - rv);
+    let bevel = min(j_x, j_y);
+
+    let vein = abs(rt_pbr_fbm(fract(uv + vec2(rt_pbr_fbm(uv, 4, 211) * 0.12, 0.0)), 8, 223) - 0.5);
+    let crack = smoothstep(0.012, 0.055, vein);
+    let micro = rt_pbr_fbm(uv, 32, 229);
+
+    return clamp(0.62 + slab_h + (bevel - 1.0) * 0.44 + (crack - 1.0) * 0.14 + (micro - 0.5) * 0.12, 0.0, 1.0);
+}
+
+fn rt_basalt_alb(uv: Vec2) -> Vec4 {
+    let rows = 4.0;
+    let r_id = int(floor(uv.y * rows));
+    let rv = fract(uv.y * rows);
+    let u_off = float(r_id % 2) * 0.125;
+    let u_shift = fract(uv.x + u_off);
+    let c_id = int(floor(u_shift * 4.0));
+    let ru = fract(u_shift * 4.0);
+
+    let slab_t = rt_pbr_hash(c_id, r_id, 4, 233);
+    let j_x = smoothstep(0.0, 0.028, ru) * smoothstep(0.0, 0.028, 1.0 - ru);
+    let j_y = smoothstep(0.0, 0.028, rv) * smoothstep(0.0, 0.028, 1.0 - rv);
+    let seam_ao = mix(0.32, 1.0, min(j_x, j_y));
+
+    let warp = rt_pbr_fbm(uv, 4, 211) * 0.12;
+    let vein_v = abs(rt_pbr_fbm(fract(uv + vec2(warp, -warp * 0.6)), 8, 223) - 0.5);
+    let vein_bright = smoothstep(0.06, 0.008, vein_v) * 0.12;
+    let macro_m = rt_pbr_fbm(uv, 8, 241);
+    let grit = rt_pbr_fbm(uv, 32, 229);
+
+    let luma = (0.58 + (slab_t - 0.5) * 0.20 + (macro_m - 0.5) * 0.14 + (grit - 0.5) * 0.10 + vein_bright) * seam_ao;
+    let rgb = vec3(luma * 0.98, luma * 1.00, luma * 1.03);
+    let rough = clamp(mix(0.92, 0.42 + (1.0 - slab_t) * 0.18 + (0.5 - grit) * 0.16, min(j_x, j_y)), 0.25, 0.96);
+    return vec4(saturate(rgb.x), saturate(rgb.y), saturate(rgb.z), rough);
+}
+
+// ----------------------------------------------------------------------------
+// 6. 30X Cold-Rolled Brushed Stainless Steel Aerospace Livery
+// ----------------------------------------------------------------------------
+fn rt_brushed_h(uv: Vec2) -> Float {
+    let brush1 = rt_pbr_fbm(vec2(fract(uv.x * 2.0), fract(uv.y * 32.0)), 8, 401);
+    let pu = fract(uv.x * 4.0);
+    let pv = fract(uv.y * 4.0);
+    let j_u = smoothstep(0.0, 0.012, pu) * smoothstep(0.0, 0.012, 1.0 - pu);
+    let j_v = smoothstep(0.0, 0.012, pv) * smoothstep(0.0, 0.012, 1.0 - pv);
+    let panel = min(j_u, j_v);
+    let d_fast = length(vec2(min(pu, 1.0 - pu) - 0.055, min(pv, 1.0 - pv) - 0.055));
+    let fast = smoothstep(0.008, 0.018, d_fast);
+    return clamp(0.60 + (brush1 - 0.5) * 0.12 + (panel - 1.0) * 0.40 + (fast - 1.0) * 0.18, 0.0, 1.0);
+}
+
+fn rt_brushed_alb(uv: Vec2) -> Vec4 {
+    let brush1 = rt_pbr_fbm(vec2(fract(uv.x * 2.0), fract(uv.y * 32.0)), 8, 401);
+    let brush2 = rt_pbr_val(vec2(fract(uv.x * 4.0), fract(uv.y * 64.0)), 8, 409);
+    let grain = brush1 * 0.65 + brush2 * 0.35;
+
+    let pu = fract(uv.x * 4.0);
+    let pv = fract(uv.y * 4.0);
+    let j_u = smoothstep(0.0, 0.012, pu) * smoothstep(0.0, 0.012, 1.0 - pu);
+    let j_v = smoothstep(0.0, 0.012, pv) * smoothstep(0.0, 0.012, 1.0 - pv);
+    let panel = mix(0.45, 1.0, min(j_u, j_v));
+
+    let d_fast = length(vec2(min(pu, 1.0 - pu) - 0.055, min(pv, 1.0 - pv) - 0.055));
+    let fastener = mix(0.68, 1.0, smoothstep(0.008, 0.018, d_fast));
+
+    let sheet_t = rt_pbr_hash(int(floor(uv.x * 4.0)), int(floor(uv.y * 4.0)), 4, 419);
+    let steel_v = (0.64 + (grain - 0.5) * 0.18 + (sheet_t - 0.5) * 0.08) * panel * fastener;
+    let rgb = vec3(steel_v * 0.97, steel_v * 0.99, steel_v * 1.03);
+    let rough = clamp(mix(0.84, 0.20 + (1.0 - grain) * 0.16, min(j_u, j_v)), 0.14, 0.92);
+    return vec4(saturate(rgb.x), saturate(rgb.y), saturate(rgb.z), rough);
+}
+
+fn rt_pbr_height(uv: Vec2, kind: Int) -> Float {
+    if kind == 0 { return rt_granite_h(uv); }
+    if kind == 1 { return rt_bark_h(uv); }
+    if kind == 2 { return rt_floor_h(uv); }
+    if kind == 3 { return rt_concrete_h(uv); }
+    if kind == 4 { return rt_steel_h(uv); }
+    if kind == 5 { return rt_basalt_h(uv); }
+    return rt_brushed_h(uv);
+}
+
+kernel rt_cinema.pbr_albedo@1 {
+    requires { field.write; }
+    param kind: Int = 0;
+    output result: Grid<Vec4 as unorm8>;
+
+    compute {
+        let uv = (coord() + 0.5) / max(domain(), vec2(1.0, 1.0));
+        if kind == 0 { return rt_granite_alb(uv); }
+        if kind == 1 { return rt_bark_alb(uv); }
+        if kind == 2 { return rt_floor_alb(uv); }
+        if kind == 3 { return rt_concrete_alb(uv); }
+        if kind == 4 { return rt_steel_alb(uv); }
+        if kind == 5 { return rt_basalt_alb(uv); }
+        return rt_brushed_alb(uv);
+    }
+}
+
+kernel rt_cinema.pbr_normal@1 {
+    requires { field.write; }
+    param kind: Int = 0;
+    output result: Grid<Vec2 as unorm8>;
+
+    compute {
+        let ext = max(domain(), vec2(1.0, 1.0));
+        let uv = (coord() + 0.5) / ext;
+        let eps = 1.0 / ext.x;
+        let strength = if kind == 0 {
+            7.2
+        } else if kind == 1 {
+            6.8
+        } else if kind == 2 {
+            5.4
+        } else if kind == 3 {
+            6.4
+        } else if kind == 4 {
+            8.4
+        } else if kind == 5 {
+            7.2
+        } else {
+            5.2
+        };
+        let h_l = rt_pbr_height(fract(uv - vec2(eps, 0.0)), kind);
+        let h_r = rt_pbr_height(fract(uv + vec2(eps, 0.0)), kind);
+        let h_d = rt_pbr_height(fract(uv - vec2(0.0, eps)), kind);
+        let h_u = rt_pbr_height(fract(uv + vec2(0.0, eps)), kind);
+        let n = normalize(vec3((h_l - h_r) * strength, (h_d - h_u) * strength, 1.0));
+        return vec2(n.x * 0.5 + 0.5, n.y * 0.5 + 0.5);
+    }
+}

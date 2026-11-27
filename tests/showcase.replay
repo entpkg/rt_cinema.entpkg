@@ -1,0 +1,20 @@
+# Deterministic GPU verification for `rt_cinema.entpkg` (all 3 drop-in sub-graphs + zero-asset 16x aniso PBR)
+scene showcase.esn
+window 640 360
+
+frame 0.00
+expect count rt_sh.dims = 3
+expect rt_sh.dims[1] = 320
+expect taa_state.result[0].enabled = 1
+
+frame 0.05 to 0.45 every 0.05
+expect taa_state.result[0].frame > 5
+expect count gtao.result = 57600
+expect finish.result[0].x > 0.05
+
+# Toggle TAA off via key 'T' (ASCII 84)
+key 84 down
+frame 0.50
+key 84 up
+frame 0.55
+expect taa_state.result[0].enabled = 0

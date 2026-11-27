@@ -1,0 +1,57 @@
+//! Drop-in Capped Half-Res Multi-Mesh Hardware RT Soft Sun Shadows (`native.trace@2 { flags = 1 }`)!
+//! Uses GPU indirect ray compaction and zero-stall dynamic TLAS reuse.
+//! Outputs `hits: Rows<TraceHit>` and `dims: Rows<Int>` (`[w*h, w, h]`) — sample smoothly via `rt_sample_shadow_hits`.
+use "../kernels/";
+use "geometry.entpkg";
+use "raster.entpkg";
+
+input surface: Grid<Surface>;
+input lens: Rows<Lens>;
+input sun: Rows<Vec3>;
+input taa_state: Rows<RtTaaState>;
+input vertices: Rows<Vec3>;
+input triangles: Rows<TraceTriangle>;
+input meshes: Rows<TraceMesh>;
+input instances: Rows<TraceInstance>;
+
+param near: Float = 0.08;
+param far: Float = 265.0;
+param max_w: Int = 960;
+param max_h: Int = 600;
+param mask: Int = 255;
+param sun_radius_near: Float = 0.012;
+param sun_radius_far: Float = 0.002;
+param max_shadow_dist: Float = 240.0;
+
+node dims: rt_cinema.rt_dims@1 {
+    max_w = max_w;
+    max_h = max_h;
+    domain = 3;
+}
+
+node rays: rt_cinema.rt_shadow_rays@1 {
+    dims <- dims.result;
+    surface <- surface;
+    lens_in <- lens;
+    sun_in <- sun;
+    taa_state <- taa_state;
+    near = near;
+    far = far;
+    sun_radius_near = sun_radius_near;
+    sun_radius_far = sun_radius_far;
+    max_shadow_dist = max_shadow_dist;
+    domain = value(dims, 0);
+}
+
+node trace: native.trace@2 {
+    rays <- rays.result;
+    vertices <- vertices;
+    triangles <- triangles;
+    meshes <- meshes;
+    instances <- instances;
+    flags = 1;
+    mask = mask;
+}
+
+output hits <- trace.hits;
+output dims <- dims.result;

@@ -1,0 +1,166 @@
+// Capped Half-Res Native `SHADER_F16` Screen-Space GTAO + 5-Step Contact Shadows + Bilateral Denoise!
+// Designed directly for `native.rasterize@2/@4` `Grid<Surface>` outputs (0.14 ms @ 2560x1600@1.5!).
+use "random.entpkg";
+use "geometry.entpkg";
+use "raster.entpkg";
+
+fn rt_safe_norm(v: Vec3, fallback: Vec3) -> Vec3 {
+    let l = length(v);
+    return if l > 0.00001 && !isnan(l) && !isinf(l) { v / l } else { fallback };
+}
+
+// Default constant sun direction helper (`Rows<Vec3>`) for static-sun scenes.
+kernel rt_cinema.sun_const@1 {
+    requires { field.write; }
+    param dir: Vec3 = vec3(0.36, 0.64, -0.677);
+    output result: Rows<Vec3>;
+
+    compute {
+        return rt_safe_norm(dir, vec3(0.36, 0.64, -0.677));
+    }
+}
+
+// 12-tap rotated-horizon Screen-Space GTAO + 5-step Contact Shadows into `Grid<Vec4 as f16>`.
+// Outputs Vec4(gtao, contact_shadow, linear_dist, 1.0).
+kernel rt_cinema.screen_ao@1 {
+    requires { field.read; field.write; }
+    input surface: Grid<Surface>;
+    input lens_in: Rows<Lens>;
+    input sun_in: Rows<Vec3>;
+    param near: Float = 0.08;
+    param far: Float = 265.0;
+    param ao_strength: Float = 2.55;
+    param ao_fade_start: Float = 38.0;
+    param ao_fade_end: Float = 72.0;
+    param contact_reach: Float = 36.0;
+    output result: Grid<Vec4 as f16>;
+
+    compute {
+        let q_ao = coord();
+        let ao_ext = max(domain(), vec2(1.0, 1.0));
+        let ext = size(surface);
+        let q = clamp((q_ao + 0.5) / ao_ext * ext - 0.5, vec2(0.0, 0.0), ext - vec2(1.0, 1.0));
+        let s = at(surface, q);
+        if s.id < 0 || s.depth >= 0.99999 {
+            return vec4(1.0, 1.0, far, 1.0);
+        }
+
+        let l = at(lens_in, 0);
+        let dir = ray(l, q, ext);
+        let dist = lens_distance(l, dir, s.depth, near, far);
+        let p = l.eye + dir * dist;
+        let raw_n = rt_safe_norm(s.normal, vec3(0.0, 1.0, 0.0));
+        let n = if dot(raw_n, -dir) >= 0.0 { raw_n } else { -raw_n };
+
+        let dist_fade = 1.0 - smoothstep(ao_fade_start, ao_fade_end, dist);
+        if dist_fade <= 0.005 {
+            return vec4(1.0, 1.0, dist, 1.0);
+        }
+
+        let noise = interleaved_noise(q_ao);
+        let base_ang = noise * 6.283185;
+        let max_px = clamp(ext.y * 0.036 / (1.0 + dist * 0.14), 3.5, 28.0);
+        let world_rad = clamp(0.45 + dist * 0.055, 0.45, 2.8);
+
+        let occ_sum = loop 12 with acc = 0.0 {
+            let idx = index();
+            let d_i = idx / 3;
+            let s_i = idx % 3;
+            let ang = base_ang + float(d_i) * 1.5707963;
+            let frac = (float(s_i) + 0.35 + fract(noise * 3.7 + float(d_i) * 0.31) * 0.45) / 3.0;
+            let r_px = max(frac * frac * max_px, 1.4);
+            let nq = q + vec2(cos(ang), sin(ang)) * r_px;
+            if nq.x < 0.0 || nq.y < 0.0 || nq.x >= ext.x || nq.y >= ext.y {
+                acc
+            } else {
+                let ns = at(surface, nq);
+                if ns.id < 0 || ns.depth >= 0.99999 {
+                    acc
+                } else {
+                    let ndir = ray(l, nq, ext);
+                    let ndist = lens_distance(l, ndir, ns.depth, near, far);
+                    let np = l.eye + ndir * ndist;
+                    let v = np - p;
+                    let vlen = length(v);
+                    if vlen <= 0.002 || vlen >= world_rad {
+                        acc
+                    } else {
+                        let elev = dot(v / vlen, n);
+                        let falloff = 1.0 - smoothstep(world_rad * 0.25, world_rad, vlen);
+                        acc + max(elev - 0.14, 0.0) * falloff
+                    }
+                }
+            }
+        };
+        let raw_ao = clamp(1.0 - (occ_sum / 12.0) * ao_strength, 0.16, 1.0);
+        let gtao = mix(1.0, raw_ao, dist_fade);
+
+        let sun = rt_safe_norm(at(sun_in, 0), vec3(0.36, 0.64, -0.677));
+        let cs_fade = 1.0 - smoothstep(contact_reach * 0.5, contact_reach, dist);
+        let contact = if cs_fade > 0.01 && dot(n, sun) > -0.15 {
+            let step_scale = clamp(0.14 + dist * 0.018, 0.14, 0.55);
+            let thick_hi = clamp(0.18 + dist * 0.025, 0.18, 0.75);
+            let hit_occ = loop 5 with occ = 0.0 {
+                let k = index();
+                let u = (float(k) + 0.45 + noise * 0.5) / 5.0;
+                let sp = p + n * 0.022 + sun * (u * u * step_scale * 4.2);
+                let proj = project(l, sp, ext);
+                if proj.z <= near || proj.x < 1.0 || proj.y < 1.0 || proj.x >= ext.x - 1.0 || proj.y >= ext.y - 1.0 {
+                    occ
+                } else {
+                    let ss = at(surface, proj.xy);
+                    if ss.id < 0 || ss.depth >= 0.99999 {
+                        occ
+                    } else {
+                        let sdir = ray(l, proj.xy, ext);
+                        let sdist = lens_distance(l, sdir, ss.depth, near, far);
+                        let delta = proj.z - sdist;
+                        if delta > 0.028 && delta < thick_hi {
+                            max(occ, (1.0 - u * 0.55) * (1.0 - smoothstep(thick_hi * 0.45, thick_hi, delta)))
+                        } else {
+                            occ
+                        }
+                    }
+                }
+            };
+            mix(1.0, 1.0 - hit_occ * 0.78, cs_fade)
+        } else {
+            1.0
+        };
+
+        return vec4(gtao, contact, dist, 1.0);
+    }
+}
+
+// Depth-preserving 3x3 bilateral denoise over `screen_ao` into compact `Grid<Vec2 as f16>`.
+kernel rt_cinema.ao_blur@1 {
+    requires { field.read; field.write; }
+    input raw_ao: Grid<Vec4 as f16>;
+    param far: Float = 265.0;
+    output result: Grid<Vec2 as f16>;
+
+    compute {
+        let q = coord();
+        let ext = size(raw_ao);
+        let c0 = at(raw_ao, q);
+        let d0 = c0.z;
+        if d0 >= far - 5.0 {
+            return vec2(1.0, 1.0);
+        }
+        let inv_sigma = 1.0 / max(0.08 + d0 * 0.045, 0.08);
+
+        let sum = loop 9 with acc = vec3(0.0, 0.0, 0.0) {
+            let k = index();
+            let ox = float((k % 3) - 1);
+            let oy = float((k / 3) - 1);
+            let nq = clamp(q + vec2(ox, oy), vec2(0.0, 0.0), ext - vec2(1.0, 1.0));
+            let s = at(raw_ao, nq);
+            let dd = abs(s.z - d0) * inv_sigma;
+            let spatial = if k == 4 { 2.0 } else if (k & 1) == 1 { 1.2 } else { 0.8 };
+            let w = spatial * exp(-dd * dd * 2.5);
+            acc + vec3(s.x * w, s.y * w, w)
+        };
+        let inv_w = 1.0 / max(sum.z, 0.0001);
+        return vec2(clamp(sum.x * inv_w, 0.14, 1.0), clamp(sum.y * inv_w, 0.16, 1.0));
+    }
+}

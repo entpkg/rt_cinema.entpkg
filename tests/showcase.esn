@@ -1,0 +1,100 @@
+//! Standalone `rt_cinema.entpkg` verification showcase:
+//! Demonstrates full Multi-Mesh Hardware RT Shadows, Half-Res SHADER_F16 GTAO,
+//! Zero-Asset 16x Anisotropic Auto-Mipmap GPU PBR, 3D World Wavefront, and
+//! Drop-In Zero-Flicker TAA + Bokeh DOF + Bloom + AgX + FXAA in < 100 lines!
+use "geometry.entpkg";
+use "raster.entpkg";
+use "rt_cinema.entpkg";
+use "showcase.ent";
+
+node lens: rt_demo.lens@1 { domain = 1; }
+node sun: rt_cinema.sun_const@1 { dir = vec3(0.58, 0.56, 0.59); domain = 1; }
+node cut: rt_cinema.cut_none@1 { domain = 1; }
+
+node taa0: rt_cinema.taa_start@1 { taa_on = 1; domain = 1; }
+node taa_state: rt_cinema.taa_step@1 {
+    previous <~ taa_state.result from taa0.result;
+    cut_id <- cut.result;
+    domain = 1;
+}
+
+// Zero-Asset 1024x1024 ONCE-Cached GPU PBR maps (auto-mipmapped + 16x aniso via 4-arg at_repeat!)
+node conc_alb:  rt_cinema.pbr_albedo@1 { kind = 3; domain = vec2(1024, 1024); }
+node conc_nrm:  rt_cinema.pbr_normal@1 { kind = 3; domain = vec2(1024, 1024); }
+node gran_alb:  rt_cinema.pbr_albedo@1 { kind = 0; domain = vec2(1024, 1024); }
+node gran_nrm:  rt_cinema.pbr_normal@1 { kind = 0; domain = vec2(1024, 1024); }
+node steel_alb: rt_cinema.pbr_albedo@1 { kind = 4; domain = vec2(1024, 1024); }
+node steel_nrm: rt_cinema.pbr_normal@1 { kind = 4; domain = vec2(1024, 1024); }
+
+node verts: rt_demo.verts@1 { domain = 144; }
+node tris: rt_demo.tris@1 { domain = 72; }
+node faces: rt_demo.faces@1 { domain = 72; }
+node meshes: rt_demo.meshes@1 { domain = 1; }
+node instances: rt_demo.instances@1 { domain = 1; }
+
+node proj: rt_demo.project@1 {
+    verts <- verts.result;
+    lens_in <- lens.result;
+    taa_state <- taa_state.result;
+    domain = 144;
+}
+
+node rast: native.rasterize@1 {
+    vertices <- proj.result;
+    triangles <- faces.result;
+    domain = max(ceil(window() / max(scale(), 1)), vec2(1, 1));
+}
+
+// Drop-in Sub-Graph 1: Half-Res SHADER_F16 GTAO + Contact Shadows
+node gtao: graph "../graphs/gtao.esn" {
+    surface <- rast.surface;
+    lens <- lens.result;
+    sun <- sun.result;
+    far = 200.0;
+}
+
+// Drop-in Sub-Graph 2: Capped Half-Res Multi-Mesh Hardware RT Soft Sun Shadows
+node rt_sh: graph "../graphs/rt_shadows.esn" {
+    surface <- rast.surface;
+    lens <- lens.result;
+    sun <- sun.result;
+    taa_state <- taa_state.result;
+    vertices <- verts.result;
+    triangles <- tris.result;
+    meshes <- meshes.result;
+    instances <- instances.result;
+    far = 200.0;
+}
+
+// Scene PBR Shader outputting `Grid<Vec4 as f16>`
+node raw_hdr: rt_demo.shade@1 {
+    surface <- rast.surface;
+    ao_map <- gtao.result;
+    rt_sh_hits <- rt_sh.hits;
+    rt_sh_dims <- rt_sh.dims;
+    lens_in <- lens.result;
+    sun_in <- sun.result;
+    taa_state <- taa_state.result;
+    conc_alb <- conc_alb.result;
+    conc_nrm <- conc_nrm.result;
+    gran_alb <- gran_alb.result;
+    gran_nrm <- gran_nrm.result;
+    steel_alb <- steel_alb.result;
+    steel_nrm <- steel_nrm.result;
+    domain = size(surface);
+}
+
+node no_vol: rt_cinema.vol_none@1 { domain = vec2(1, 1); }
+
+// Drop-in Sub-Graph 3: Full SHADER_F16 Filmic Post Stack (TAA + Bokeh DOF + Bloom + AgX + FXAA)
+node finish: graph "../graphs/cinema_finish.esn" {
+    hdr <- raw_hdr.result;
+    vol <- no_vol.result;
+    lens <- lens.result;
+    taa_state <- taa_state.result;
+    far = 200.0;
+    exposure = 1.15;
+    bloom_amount = 0.22;
+}
+
+output result <- finish.result;

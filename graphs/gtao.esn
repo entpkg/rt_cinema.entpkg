@@ -1,0 +1,38 @@
+//! Drop-in Capped Half-Res Native `SHADER_F16` Screen-Space GTAO + Contact Shadows + Bilateral Denoise!
+//! Wire directly to `native.rasterize@2/@4`'s `surface`, `lens`, and `sun` (`Rows<Vec3>`).
+//! Returns `result: Grid<Vec2 as f16>` (`x = gtao`, `y = contact_shadow`) — sample via `at_linear`.
+use "../kernels/";
+use "geometry.entpkg";
+use "raster.entpkg";
+
+input surface: Grid<Surface>;
+input lens: Rows<Lens>;
+input sun: Rows<Vec3>;
+
+param near: Float = 0.08;
+param far: Float = 265.0;
+param ao_strength: Float = 2.55;
+param ao_fade_start: Float = 38.0;
+param ao_fade_end: Float = 72.0;
+param contact_reach: Float = 36.0;
+
+node raw_ao: rt_cinema.screen_ao@1 {
+    surface <- surface;
+    lens_in <- lens;
+    sun_in <- sun;
+    near = near;
+    far = far;
+    ao_strength = ao_strength;
+    ao_fade_start = ao_fade_start;
+    ao_fade_end = ao_fade_end;
+    contact_reach = contact_reach;
+    domain = max(min(ceil(size(surface) / 2), vec2(960, 600)), vec2(1, 1));
+}
+
+node clean_ao: rt_cinema.ao_blur@1 {
+    raw_ao <- raw_ao.result;
+    far = far;
+    domain = size(raw_ao);
+}
+
+output result <- clean_ao.result;

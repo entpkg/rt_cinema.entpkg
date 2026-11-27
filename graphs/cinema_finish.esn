@@ -1,0 +1,103 @@
+//! Drop-in `SHADER_F16` Filmic Post-Processing Stack:
+//!   `sanitize_hdr` (+ volumetric composite) -> Zero-Flicker Halton TAA -> Capped `640x400` Optical Bokeh DOF
+//!   & Wide-Halo Bloom -> AgX Filmic Grade + Distance-Faded Contrast Sharpening -> FXAA!
+use "../kernels/";
+use "geometry.entpkg";
+use "image.entpkg";
+
+input hdr: Grid<Vec4 as f16>;
+input vol: Grid<Vec4 as f16>;
+input lens: Rows<Lens>;
+input taa_state: Rows<RtTaaState>;
+
+param near: Float = 0.08;
+param far: Float = 265.0;
+param exposure: Float = 1.12;
+param bloom_threshold: Float = 2.0;
+param bloom_amount: Float = 0.16;
+param dof_near: Float = 2.0;
+param dof_far: Float = 160.0;
+param dof_strength: Float = 0.85;
+param sharpen: Float = 0.28;
+param saturation: Float = 1.11;
+param contrast: Float = 0.09;
+param shadow_tint: Vec3 = vec3(0.94, 0.98, 1.03);
+param highlight_tint: Vec3 = vec3(1.03, 1.01, 0.96);
+param vignette: Float = 0.085;
+param grain: Float = 0.007;
+
+node clean_hdr: rt_cinema.sanitize_hdr@1 {
+    source <- hdr;
+    vol <- vol;
+    far = far;
+    domain = size(source);
+}
+
+node cur_lens: rt_cinema.same_lens@1 {
+    lens_in <- lens;
+    domain = 1;
+}
+
+node taa_init: rt_cinema.taa_init@1 {
+    domain = max(ceil(window() / max(scale(), 1)), vec2(1, 1));
+}
+
+node taa_hdr: rt_cinema.taa_resolve@1 {
+    current <- clean_hdr.result;
+    history <~ taa_hdr.result from taa_init.result;
+    lens_cur <- cur_lens.result;
+    lens_prev <~ cur_lens.result from cur_lens.result;
+    state <- taa_state;
+    near = near;
+    far = far;
+    domain = size(current);
+}
+
+node half_dof: image.shrink@1 {
+    source <- taa_hdr.result;
+    domain = max(min(ceil(size(source) / 2), vec2(640, 400)), vec2(1, 1));
+}
+node soft_dof: graph "image.entpkg/graphs/blur.esn" {
+    source <- half_dof.result;
+    sigma = 3.4;
+}
+
+node bright: rt_cinema.bright_pass@1 {
+    source <- taa_hdr.result;
+    threshold = bloom_threshold;
+    far = far;
+    domain = max(min(ceil(size(source) / 2), vec2(640, 400)), vec2(1, 1));
+}
+node bloom: graph "image.entpkg/graphs/blur.esn" {
+    source <- bright.result;
+    sigma = 3.2;
+}
+
+node graded: rt_cinema.cinema_grade@1 {
+    hdr <- taa_hdr.result;
+    soft_dof <- soft_dof.result;
+    bloom <- bloom.result;
+    exposure = exposure;
+    bloom_amount = bloom_amount;
+    dof_near = dof_near;
+    dof_far = dof_far;
+    dof_strength = dof_strength;
+    sharpen = sharpen;
+    saturation = saturation;
+    contrast = contrast;
+    shadow_tint = shadow_tint;
+    highlight_tint = highlight_tint;
+    vignette = vignette;
+    grain = grain;
+    far = far;
+    domain = size(hdr);
+}
+
+node final_view: image.fxaa@1 {
+    image <- graded.result;
+    subpixel = 0.28;
+    domain = size(image);
+}
+
+output result <- final_view.result;
+output taa_hdr <- taa_hdr.result;

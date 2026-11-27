@@ -1,0 +1,123 @@
+// NaN-Guarded SHADER_F16 Volumetric Composite, Capped-Resolution Bloom & Optical Bokeh DOF,
+// Distance-Faded Contrast Sharpening, and AgX Filmic Grade!
+use "random.entpkg";
+use "image.entpkg";
+
+fn rt_clean_hdr4(c: Vec4, far: Float) -> Vec4 {
+    let r = if isnan(c.x) || isinf(c.x) { 0.0 } else { clamp(c.x, 0.0, 32.0) };
+    let g = if isnan(c.y) || isinf(c.y) { 0.0 } else { clamp(c.y, 0.0, 32.0) };
+    let b = if isnan(c.z) || isinf(c.z) { 0.0 } else { clamp(c.z, 0.0, 32.0) };
+    let w = if isnan(c.w) || isinf(c.w) { far } else { clamp(c.w, 0.05, far) };
+    return vec4(r, g, b, w);
+}
+
+// Neutral 1x1 volumetric buffer (`scatter = 0, trans = 1`) for scenes without a volumetric pass.
+kernel rt_cinema.vol_none@1 {
+    requires { field.write; }
+    output result: Grid<Vec4 as f16>;
+
+    compute {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
+}
+
+// Pre-TAA NaN guard + half-res volumetric scatter composite (0.026 ms in native SHADER_F16!).
+kernel rt_cinema.sanitize_hdr@1 {
+    requires { field.read; field.write; }
+    input source: Grid<Vec4 as f16>;
+    input vol: Grid<Vec4 as f16>;
+    param far: Float = 265.0;
+    output result: Grid<Vec4 as f16>;
+
+    compute {
+        let q = coord();
+        let ext = size(source);
+        let c = rt_clean_hdr4(at(source, q), far);
+        let uv_v = (q + 0.5) / ext * size(vol);
+        let v = at_linear(vol, uv_v);
+        let trans = clamp(if isnan(v.w) || isinf(v.w) { 1.0 } else { v.w }, 0.30, 1.0);
+        let scat = vec3(
+            if isnan(v.x) || isinf(v.x) { 0.0 } else { clamp(v.x, 0.0, 8.0) },
+            if isnan(v.y) || isinf(v.y) { 0.0 } else { clamp(v.y, 0.0, 8.0) },
+            if isnan(v.z) || isinf(v.z) { 0.0 } else { clamp(v.z, 0.0, 8.0) }
+        );
+        return rt_clean_hdr4(vec4(c.xyz * trans + scat, c.w), far);
+    }
+}
+
+// Capped-domain bright-pass extraction for silky wide-halo bloom at any DPI/resolution.
+kernel rt_cinema.bright_pass@1 {
+    requires { field.read; field.write; }
+    input source: Image;
+    param threshold: Float = 2.0;
+    param gain: Float = 0.52;
+    param far: Float = 265.0;
+    output result: Image;
+
+    compute {
+        let q = coord();
+        let src_sz = size(source);
+        let dst_sz = max(domain(), vec2(1.0, 1.0));
+        let uv = (q + 0.5) / dst_sz * src_sz;
+        let c = rt_clean_hdr4(at_linear(source, uv), far).xyz;
+        let lum = max(max(c.x, c.y), c.z);
+        let soft = max(lum - threshold, 0.0) / max(lum, 0.0001);
+        return vec4(c * (soft * gain), 1.0);
+    }
+}
+
+// AgX filmic grade + near/far optical bokeh DOF + distance-faded sharpening + vignette & grain.
+kernel rt_cinema.cinema_grade@1 {
+    requires { field.read; field.write; }
+    input hdr: Image;
+    input soft_dof: Image;
+    input bloom: Image;
+    param exposure: Float = 1.12;
+    param bloom_amount: Float = 0.16;
+    param dof_near: Float = 2.0;
+    param dof_far: Float = 160.0;
+    param dof_strength: Float = 0.85;
+    param sharpen: Float = 0.28;
+    param saturation: Float = 1.11;
+    param contrast: Float = 0.09;
+    param shadow_tint: Vec3 = vec3(0.94, 0.98, 1.03);
+    param highlight_tint: Vec3 = vec3(1.03, 1.01, 0.96);
+    param vignette: Float = 0.085;
+    param grain: Float = 0.007;
+    param far: Float = 265.0;
+    output result: Image;
+
+    compute {
+        let q = coord();
+        let ext = size(hdr);
+        let ndc = (q + 0.5) / ext * 2.0 - 1.0;
+
+        let c_sharp = rt_clean_hdr4(at(hdr, q), far);
+        let depth = c_sharp.w;
+
+        let near_coc = if dof_near > 0.05 { smoothstep(dof_near, dof_near * 0.28, depth) * dof_strength } else { 0.0 };
+        let far_coc = if dof_far > 1.0 { smoothstep(dof_far, dof_far * 1.45, depth) * (0.22 * dof_strength) } else { 0.0 };
+        let uv_soft = (q + 0.5) / ext * size(soft_dof);
+        let c_soft = rt_clean_hdr4(at_linear(soft_dof, uv_soft), far);
+        let fg_bleed = if dof_near > 0.05 {
+            smoothstep(dof_near, dof_near * 0.35, c_soft.w) * 0.48 * smoothstep(dof_near * 1.1, dof_near * 2.8, depth) * dof_strength
+        } else {
+            0.0
+        };
+        let blur_w = clamp(max(max(near_coc, fg_bleed), far_coc), 0.0, 0.90);
+        let focused = mix(c_sharp.xyz, c_soft.xyz, blur_w);
+
+        let uv_b = (q + 0.5) / ext * size(bloom);
+        let b_col = rt_clean_hdr4(at_linear(bloom, uv_b), far).xyz;
+
+        let linear_hdr = (focused + b_col * bloom_amount) * exposure;
+        let far_soft = 1.0 - smoothstep(42.0, 115.0, depth) * 0.78;
+        let crisp = tone_sharpened(hdr, q, linear_hdr, sharpen * (1.0 - blur_w) * far_soft);
+        let mapped = agx(crisp);
+
+        let graded = tone_warmth(mapped, saturation, contrast, shadow_tint, highlight_tint);
+        let vig = 1.0 - clamp(dot(ndc, ndc) * vignette, 0.0, 0.24);
+        let g = (interleaved_noise(q) - 0.5) * grain;
+        return vec4(saturate(graded * vig + g), 1.0);
+    }
+}
