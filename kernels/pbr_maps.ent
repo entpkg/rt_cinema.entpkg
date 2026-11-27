@@ -80,6 +80,59 @@ fn rt_apply_tangent_normal(n_geom: Vec3, tn: Vec3) -> Vec3 {
     return rt_safe_norm(t_ax * tn.x + b_ax * tn.y + n_geom * tn.z, n_geom);
 }
 
+// Seamless 3-axis blended 16x hardware anisotropic Triplanar albedo+roughness sampling for curved
+// cliffs, boulders, arches & organic rock (zero 45-degree axis-switch seams!).
+fn rt_triplanar_weights(n_geom: Vec3) -> Vec3 {
+    let an = abs(n_geom);
+    let w = an * an * an * an;
+    return w / max(w.x + w.y + w.z, 0.0001);
+}
+
+fn rt_triplanar_albedo(
+    tex: Grid<Vec4 as unorm8>, world_pos: Vec3, n_geom: Vec3, fp: RtFootprint, scale_f: Float
+) -> Vec4 {
+    let w = rt_triplanar_weights(n_geom);
+    let sz = size(tex);
+    let s = sz * scale_f;
+    let cx = if w.x > 0.01 {
+        at_repeat(tex, vec2(world_pos.z, world_pos.y) * s, vec2(fp.p_dx.z, fp.p_dx.y) * s, vec2(fp.p_dy.z, fp.p_dy.y) * s)
+    } else { vec4(0.0, 0.0, 0.0, 0.0) };
+    let cy = if w.y > 0.01 {
+        at_repeat(tex, world_pos.xz * s, fp.p_dx.xz * s, fp.p_dy.xz * s)
+    } else { vec4(0.0, 0.0, 0.0, 0.0) };
+    let cz = if w.z > 0.01 {
+        at_repeat(tex, vec2(world_pos.x, world_pos.y) * s, vec2(fp.p_dx.x, fp.p_dx.y) * s, vec2(fp.p_dy.x, fp.p_dy.y) * s)
+    } else { vec4(0.0, 0.0, 0.0, 0.0) };
+    return cx * w.x + cy * w.y + cz * w.z;
+}
+
+// Seamless 3-axis blended 16x anisotropic Triplanar tangent-normal perturbation (Whiteout blend).
+fn rt_triplanar_normal(
+    nrm_tex: Grid<Vec2 as unorm8>, world_pos: Vec3, n_geom: Vec3, fp: RtFootprint, scale_f: Float, strength: Float
+) -> Vec3 {
+    let w = rt_triplanar_weights(n_geom);
+    let sz = size(nrm_tex);
+    let s = sz * scale_f;
+    let sx = if n_geom.x >= 0.0 { 1.0 } else { -1.0 };
+    let sy = if n_geom.y >= 0.0 { 1.0 } else { -1.0 };
+    let sz_s = if n_geom.z >= 0.0 { 1.0 } else { -1.0 };
+
+    let nx_w = if w.x > 0.01 {
+        let t = rt_unpack_normal(at_repeat(nrm_tex, vec2(world_pos.z, world_pos.y) * s, vec2(fp.p_dx.z, fp.p_dx.y) * s, vec2(fp.p_dy.z, fp.p_dy.y) * s), strength);
+        vec3(n_geom.x + t.z * sx, n_geom.y + t.y, n_geom.z + t.x)
+    } else { vec3(0.0, 0.0, 0.0) };
+    let ny_w = if w.y > 0.01 {
+        let t = rt_unpack_normal(at_repeat(nrm_tex, world_pos.xz * s, fp.p_dx.xz * s, fp.p_dy.xz * s), strength);
+        vec3(n_geom.x + t.x, n_geom.y + t.z * sy, n_geom.z + t.y)
+    } else { vec3(0.0, 0.0, 0.0) };
+    let nz_w = if w.z > 0.01 {
+        let t = rt_unpack_normal(at_repeat(nrm_tex, vec2(world_pos.x, world_pos.y) * s, vec2(fp.p_dx.x, fp.p_dx.y) * s, vec2(fp.p_dy.x, fp.p_dy.y) * s), strength);
+        vec3(n_geom.x + t.x, n_geom.y + t.y, n_geom.z + t.z * sz_s)
+    } else { vec3(0.0, 0.0, 0.0) };
+
+    return rt_safe_norm(nx_w * w.x + ny_w * w.y + nz_w * w.z, n_geom);
+}
+
 fn rt_pbr_hash(ix: Int, iy: Int, period: Int, seed: Int) -> Float {
     let wx = ((ix % period) + period) % period;
     let wy = ((iy % period) + period) % period;

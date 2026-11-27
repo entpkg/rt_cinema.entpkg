@@ -18,6 +18,7 @@ param near: Float = 0.08;
 param far: Float = 265.0;
 param max_w: Int = 960;
 param max_h: Int = 600;
+param render_scale: Float = 1.0;
 param mask: Int = 255;
 param sun_radius_near: Float = 0.012;
 param sun_radius_far: Float = 0.002;
@@ -26,6 +27,7 @@ param max_shadow_dist: Float = 240.0;
 node dims: rt_cinema.rt_dims@1 {
     max_w = max_w;
     max_h = max_h;
+    render_scale = render_scale;
     domain = 3;
 }
 

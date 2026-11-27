@@ -29,8 +29,9 @@ node raw_ao: rt_cinema.screen_ao@1 {
     domain = max(min(ceil(size(surface) / 2), vec2(960, 600)), vec2(1, 1));
 }
 
-node clean_ao: rt_cinema.ao_blur@1 {
+node clean_ao: rt_cinema.ao_blur_sharp@1 {
     raw_ao <- raw_ao.result;
+    surface <- surface;
     far = far;
     domain = size(raw_ao);
 }

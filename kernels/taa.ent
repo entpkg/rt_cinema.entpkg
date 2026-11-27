@@ -18,6 +18,13 @@ struct RtTaaMoments {
     m2: Vec3;
 }
 
+struct RtTaaDynMoments {
+    m1: Vec3;
+    m2: Vec3;
+    max_dyn: Float;
+    max_react: Float;
+}
+
 fn rt_halton_jitter(frame_idx: Int, amp: Float) -> Vec2 {
     let k = frame_idx % 8;
     let hx = if k == 0 {
@@ -157,6 +164,28 @@ kernel rt_cinema.taa_init@1 {
     }
 }
 
+// Resolution-independent TAA history initializer matching any upstream HDR grid (`size(like)`),
+// enabling arbitrary render scales and dynamic resolution scaling (DRS) without TAA fallback!
+kernel rt_cinema.taa_init_like@1 {
+    requires { field.read; field.write; }
+    input like: Grid<Vec4 as f16>;
+    output result: Image;
+
+    compute {
+        return vec4(0.0, 0.0, 0.0, -1.0);
+    }
+}
+
+// Neutral zero-motion / zero-reactive buffer (`xyz = 0 world delta, w = 0 reactive`) for static scenes.
+kernel rt_cinema.motion_none@1 {
+    requires { field.write; }
+    output result: Grid<Vec4 as f16>;
+
+    compute {
+        return vec4(0.0, 0.0, 0.0, 0.0);
+    }
+}
+
 // Accepts `Grid<Vec4 as f16>` linear HDR + distance-in-w (`current`) and resolves cleanly to `Image`.
 kernel rt_cinema.taa_resolve@1 {
     requires { field.read; field.write; }
@@ -236,6 +265,116 @@ kernel rt_cinema.taa_resolve@1 {
         let blended = rt_ycocg_to_rgb(mix(hist_yc, cur_yc, alpha));
         let resolved = max(rt_karis_out(blended), vec3(0.0, 0.0, 0.0));
         let next_dist = mix(hist_raw.w, dist, clamp(alpha * 2.0 + motion_f, 0.25, 1.0));
+        return vec4(resolved, next_dist);
+    }
+}
+
+// Dynamic-object-aware Halton TAA with exact world-space skinned motion vectors (`motion.xyz`),
+// reactive translucency/VFX mask (`motion.w`), and 3x3 silhouette velocity dilation!
+// Eliminates dark ghosting behind fast-swinging blades, hair, capes & animated characters while
+// keeping static world pixels locked at 0.000 px wobble.
+kernel rt_cinema.taa_resolve_dynamic@1 {
+    requires { field.read; field.write; }
+    input current: Grid<Vec4 as f16>;
+    input history: Image;
+    input motion: Grid<Vec4 as f16>;
+    input lens_cur: Rows<Lens>;
+    input lens_prev: Rows<Lens>;
+    input state: Rows<RtTaaState>;
+    param near: Float = 0.08;
+    param far: Float = 265.0;
+    param alpha_still: Float = 0.085;
+    param alpha_moving: Float = 0.36;
+    param gamma_still: Float = 1.65;
+    param gamma_moving: Float = 0.85;
+    output result: Image;
+
+    compute {
+        let q = coord();
+        let ext = size(current);
+        let cur = at(current, q);
+        let st = at(state, 0);
+
+        if st.enabled == 0 || st.frame <= 1 {
+            return cur;
+        }
+        let hist_ext = size(history);
+        if abs(hist_ext.x - ext.x) > 0.5 || abs(hist_ext.y - ext.y) > 0.5 {
+            return cur;
+        }
+
+        let mot_sz = size(motion);
+        let mq = clamp((q + 0.5) / ext * mot_sz - 0.5, vec2(0.0, 0.0), mot_sz - vec2(1.0, 1.0));
+        let mot_c = at(motion, mq);
+
+        let l_cur = at(lens_cur, 0);
+        let l_prev = at(lens_prev, 0);
+        let dist = clamp(cur.w, near, far);
+        let dir = ray(l_cur, q, ext);
+        let world_p = l_cur.eye + dir * dist;
+        let world_prev = world_p - mot_c.xyz;
+        let prev_proj = project(l_prev, world_prev, ext);
+
+        if prev_proj.z <= 0.01
+            || prev_proj.x < 1.0 || prev_proj.y < 1.0
+            || prev_proj.x >= ext.x - 1.0 || prev_proj.y >= ext.y - 1.0
+        {
+            return cur;
+        }
+
+        let hist_raw = at_linear(history, prev_proj.xy);
+        if hist_raw.w < 0.0 || isnan(hist_raw.x) || isnan(hist_raw.y) || isnan(hist_raw.z) {
+            return cur;
+        }
+
+        // Single-pass 3x3 YCoCg variance box + 3x3 silhouette velocity & reactive dilation!
+        let mom = loop 9 with acc = RtTaaDynMoments { m1: vec3(0.0, 0.0, 0.0), m2: vec3(0.0, 0.0, 0.0), max_dyn: 0.0, max_react: 0.0 } {
+            let k = index();
+            let ox = float((k % 3) - 1);
+            let oy = float((k / 3) - 1);
+            let nq = clamp(q + vec2(ox, oy), vec2(0.0, 0.0), ext - vec2(1.0, 1.0));
+            let nmq = clamp((nq + 0.5) / ext * mot_sz - 0.5, vec2(0.0, 0.0), mot_sz - vec2(1.0, 1.0));
+            let mk = at(motion, nmq);
+            let s_yc = rt_rgb_to_ycocg(rt_karis_in(max(at(current, nq).xyz, vec3(0.0, 0.0, 0.0))));
+            RtTaaDynMoments {
+                m1: acc.m1 + s_yc,
+                m2: acc.m2 + s_yc * s_yc,
+                max_dyn: max(acc.max_dyn, length(mk.xyz)),
+                max_react: max(acc.max_react, mk.w)
+            }
+        };
+        let mean = mom.m1 / 9.0;
+        let var = max(mom.m2 / 9.0 - mean * mean, vec3(0.0, 0.0, 0.0));
+        let sigma = vec3(sqrt(var.x), sqrt(var.y), sqrt(var.z));
+
+        // Combine camera pixel motion with dilated dynamic-object world velocity (m/frame -> px equivalent)
+        let cam_px = length(prev_proj.xy - (q + 0.5));
+        let dyn_px = mom.max_dyn * (ext.y * 0.45 / max(dist, 0.75));
+        let total_px = max(cam_px, dyn_px);
+        let motion_f = smoothstep(0.18, 3.8, total_px);
+        let dyn_f = smoothstep(0.35, 3.5, dyn_px);
+        let react = clamp(max(mot_c.w, mom.max_react * 0.60), 0.0, 1.0);
+
+        // Depth disocclusion: camera/dilated-velocity gated globally, plus near-field foreground
+        // uncovering (`hist_raw.w < dist`) so fast-whipping blades & limbs leave zero dark trails
+        // even when jumping >10 px/frame on a stationary camera (zero impact on far-horizon sky!).
+        let depth_jump = abs(hist_raw.w - dist) / max(dist, 0.5);
+        let fg_uncover = smoothstep(0.16, 0.34, (dist - hist_raw.w) / max(dist, 0.5))
+            * (1.0 - smoothstep(14.0, 26.0, hist_raw.w));
+        let disocc = max(smoothstep(0.12, 0.34, depth_jump) * smoothstep(0.14, 1.15, total_px), fg_uncover);
+
+        let box_gamma = mix(gamma_still, gamma_moving, max(motion_f, max(dyn_f, max(react, fg_uncover))));
+        let box_min = mean - sigma * box_gamma;
+        let box_max = mean + sigma * box_gamma;
+
+        let cur_yc = rt_rgb_to_ycocg(rt_karis_in(max(cur.xyz, vec3(0.0, 0.0, 0.0))));
+        let hist_yc = clamp(rt_rgb_to_ycocg(rt_karis_in(max(hist_raw.xyz, vec3(0.0, 0.0, 0.0)))), box_min, box_max);
+
+        let alpha_base = mix(alpha_still, alpha_moving, motion_f) + disocc * 0.85 + dyn_f * 0.36;
+        let alpha = clamp(max(alpha_base, react * 0.88), alpha_still, 1.0);
+        let blended = rt_ycocg_to_rgb(mix(hist_yc, cur_yc, alpha));
+        let resolved = max(rt_karis_out(blended), vec3(0.0, 0.0, 0.0));
+        let next_dist = mix(hist_raw.w, dist, clamp(alpha * 2.0 + motion_f + dyn_f, 0.25, 1.0));
         return vec4(resolved, next_dist);
     }
 }

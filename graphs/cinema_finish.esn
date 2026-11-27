@@ -25,6 +25,9 @@ param shadow_tint: Vec3 = vec3(0.94, 0.98, 1.03);
 param highlight_tint: Vec3 = vec3(1.03, 1.01, 0.96);
 param vignette: Float = 0.085;
 param grain: Float = 0.007;
+param encode_srgb: Int = 0;
+param tone_mode: Int = 0;
+param toe_power: Float = 1.0;
 
 node clean_hdr: rt_cinema.sanitize_hdr@1 {
     source <- hdr;
@@ -38,8 +41,9 @@ node cur_lens: rt_cinema.same_lens@1 {
     domain = 1;
 }
 
-node taa_init: rt_cinema.taa_init@1 {
-    domain = max(ceil(window() / max(scale(), 1)), vec2(1, 1));
+node taa_init: rt_cinema.taa_init_like@1 {
+    like <- hdr;
+    domain = size(like);
 }
 
 node taa_hdr: rt_cinema.taa_resolve@1 {
@@ -89,6 +93,9 @@ node graded: rt_cinema.cinema_grade@1 {
     highlight_tint = highlight_tint;
     vignette = vignette;
     grain = grain;
+    encode_srgb = encode_srgb;
+    tone_mode = tone_mode;
+    toe_power = toe_power;
     far = far;
     domain = size(hdr);
 }

@@ -1,0 +1,42 @@
+//! Drop-in Jitter-Aligned Capped Half-Res Native `SHADER_F16` Screen-Space GTAO + Contact Shadows
+//! + Depth & 3D-Normal Edge-Preserving Bilateral Denoise!
+//! Wire directly to `native.rasterize@2/@3/@4`'s `surface`, unjittered `lens`, `sun` (`Rows<Vec3>`),
+//! and `taa_state` (`Rows<RtTaaState>`). Returns `result: Grid<Vec2 as f16>` (`x = gtao`, `y = contact_shadow`).
+use "../kernels/";
+use "geometry.entpkg";
+use "raster.entpkg";
+
+input surface: Grid<Surface>;
+input lens: Rows<Lens>;
+input sun: Rows<Vec3>;
+input taa_state: Rows<RtTaaState>;
+
+param near: Float = 0.08;
+param far: Float = 265.0;
+param ao_strength: Float = 2.55;
+param ao_fade_start: Float = 38.0;
+param ao_fade_end: Float = 72.0;
+param contact_reach: Float = 36.0;
+
+node raw_ao: rt_cinema.screen_ao_jitter@1 {
+    surface <- surface;
+    lens_in <- lens;
+    sun_in <- sun;
+    taa_state <- taa_state;
+    near = near;
+    far = far;
+    ao_strength = ao_strength;
+    ao_fade_start = ao_fade_start;
+    ao_fade_end = ao_fade_end;
+    contact_reach = contact_reach;
+    domain = max(min(ceil(size(surface) / 2), vec2(960, 600)), vec2(1, 1));
+}
+
+node clean_ao: rt_cinema.ao_blur_sharp@1 {
+    raw_ao <- raw_ao.result;
+    surface <- surface;
+    far = far;
+    domain = size(raw_ao);
+}
+
+output result <- clean_ao.result;

@@ -1,0 +1,18 @@
+# GPU verification for `rt_cinema.entpkg` v1.1:
+#   - Custom DRS render domain (320x180 inside 640x360 window) -> `rt_dims_of` = 160x90
+#   - Jitter-aligned GTAO + 3D-normal edge-preserving denoise (`gtao_jitter.esn`)
+#   - Dynamic-motion + velocity-dilated Halton TAA + reactive mask (`cinema_finish_dynamic.esn`)
+#   - Triplanar 16x aniso PBR + IEC `encode_srgb = 1` AgX finish
+scene dynamic_taa.esn
+window 640 360
+
+frame 0.00
+expect count rt_sh.dims = 3
+expect rt_sh.dims[1] = 160
+expect rt_sh.dims[2] = 90
+expect count gtao.result = 14400
+
+frame 0.05 to 0.30 every 0.05
+expect taa_state.result[0].frame > 4
+expect count finish.result = 57600
+expect finish.result[0].x > 0.10

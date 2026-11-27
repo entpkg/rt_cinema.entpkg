@@ -1,0 +1,94 @@
+// Dynamic motion vector, DRS, Triplanar PBR, and sRGB AgX verification kernels for `dynamic_taa.esn`.
+use "geometry.entpkg";
+use "raster.entpkg";
+use "rt_cinema.entpkg";
+use "showcase.ent";
+
+kernel rt_dyn.verts@1 {
+    requires { field.write; time.read; }
+    output result: Rows<Vec3>;
+    compute {
+        let vid = element();
+        let qid = vid / 4;
+        let cid = vid % 4;
+        let box_id = qid / 6;
+        let b = demo_box(box_id);
+        let p0 = box_face_vertex(b, qid % 6, cid);
+        let shift = if box_id == 4 { vec3(sin(time() * 4.0) * 0.75, 0.0, 0.0) } else { vec3(0.0, 0.0, 0.0) };
+        return p0 + shift;
+    }
+}
+
+kernel rt_dyn.project_drs@1 {
+    requires { field.read; field.write; }
+    input verts: Rows<Vec3>;
+    input lens_in: Rows<Lens>;
+    input taa_state: Rows<RtTaaState>;
+    output result: Rows<Corner>;
+    compute {
+        let vid = element();
+        let qid = vid / 4;
+        let l = at(lens_in, 0);
+        let ext = vec2(320.0, 180.0);
+        let raw_clip = lens_clip(l, ext, at(verts, vid), 0.08, 200.0);
+        let clip = rt_apply_clip_jitter(raw_clip, at(taa_state, 0).jitter, ext);
+        return Corner { clip: clip, normal: box_face_normal(qid % 6), uv: vec2(0.5, 0.5) };
+    }
+}
+
+kernel rt_dyn.shade@1 {
+    requires { field.read; field.write; time.read; }
+    input surface: Grid<Surface>;
+    input ao_map: Grid<Vec2 as f16>;
+    input rt_sh_hits: Rows<TraceHit>;
+    input rt_sh_dims: Rows<Int>;
+    input lens_in: Rows<Lens>;
+    input sun_in: Rows<Vec3>;
+    input taa_state: Rows<RtTaaState>;
+    input gran_alb: Grid<Vec4 as unorm8>;
+    input gran_nrm: Grid<Vec2 as unorm8>;
+    output hdr: Grid<Vec4 as f16>;
+    output motion: Grid<Vec4 as f16>;
+    compute {
+        let q = coord();
+        let ext = size(surface);
+        let l = at(lens_in, 0);
+        let sun = at(sun_in, 0);
+        let jitter = at(taa_state, 0).jitter;
+        let dir = ray(l, q - jitter, ext);
+        let s = at(surface, q);
+        let t = time();
+
+        if s.id < 0 || s.depth >= 0.99999 {
+            let sky = rt_eval_volumetric_sky(
+                dir, sun,
+                vec3(0.55, 0.35, 0.22), vec3(0.10, 0.18, 0.36),
+                vec3(0.12, 0.10, 0.14), vec3(1.15, 0.72, 0.42),
+                -0.06, 0.005, 0.25, t
+            );
+            return { hdr: vec4(sky, 200.0), motion: vec4(0.0, 0.0, 0.0, 0.0) };
+        }
+
+        let dist = lens_distance(l, dir, s.depth, 0.08, 200.0);
+        let wp = l.eye + dir * dist;
+        let n_geom = rt_safe_norm(s.normal, vec3(0.0, 1.0, 0.0));
+        let box_id = clamp((s.id / 2) / 6, 0, 5);
+
+        let fp = rt_compute_footprint(l, q, jitter, ext, wp, n_geom, dir, dist, 0.08, 200.0);
+        let alb_r = rt_triplanar_albedo(gran_alb, wp, n_geom, fp, 0.65);
+        let n = rt_triplanar_normal(gran_nrm, wp, n_geom, fp, 0.65, 1.15);
+
+        let ao_c = at_linear(ao_map, (q + 0.5) / ext * size(ao_map));
+        let rt_lit = rt_sample_shadow_hits(rt_sh_hits, q, ext, at(rt_sh_dims, 1), at(rt_sh_dims, 2));
+        let shadow = min(rt_lit, ao_c.y);
+
+        let ndl = max(dot(n, sun), 0.0);
+        let col = alb_r.xyz * (vec3(2.4, 1.65, 1.05) * (ndl * shadow) + vec3(0.24, 0.30, 0.42) * ao_c.x);
+        let vx = if box_id == 4 { cos(t * 4.0) * 0.15 } else { 0.0 };
+        let react = if box_id == 4 { 0.35 } else { 0.0 };
+        return {
+            hdr: vec4(max(col, vec3(0.0, 0.0, 0.0)), dist),
+            motion: vec4(vx, 0.0, 0.0, react)
+        };
+    }
+}

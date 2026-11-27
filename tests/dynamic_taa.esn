@@ -1,0 +1,94 @@
+//! Verification scene for `rt_cinema.entpkg` v1.1 capabilities:
+//!   - Resolution-independent DRS (`320x180` render inside a `640x360` window -> `rt_dims_of` = 160x90!)
+//!   - Jitter-aligned GTAO + 3D-normal edge-preserving bilateral denoise (`graphs/gtao_jitter.esn`)
+//!   - Dynamic-motion + 3x3 velocity-dilated Halton TAA + reactive mask (`graphs/cinema_finish_dynamic.esn`)
+//!   - Exposure-invariant sharpening + IEC `encode_srgb = 1` AgX filmic grade
+//!   - Seamless 16x anisotropic 3-axis Triplanar PBR (`rt_triplanar_albedo` / `rt_triplanar_normal`)
+use "geometry.entpkg";
+use "raster.entpkg";
+use "rt_cinema.entpkg";
+use "showcase.ent";
+use "dynamic_taa.ent";
+
+node lens: rt_demo.lens@1 { domain = 1; }
+node sun: rt_cinema.sun_const@1 { dir = vec3(0.58, 0.56, 0.59); domain = 1; }
+node cut: rt_cinema.cut_none@1 { domain = 1; }
+
+node taa0: rt_cinema.taa_start@1 { taa_on = 1; domain = 1; }
+node taa_state: rt_cinema.taa_step@1 {
+    previous <~ taa_state.result from taa0.result;
+    cut_id <- cut.result;
+    domain = 1;
+}
+
+node gran_alb: rt_cinema.pbr_albedo@1 { kind = 0; domain = vec2(256, 256); }
+node gran_nrm: rt_cinema.pbr_normal@1 { kind = 0; domain = vec2(256, 256); }
+
+node verts: rt_dyn.verts@1 { domain = 144; }
+node tris: rt_demo.tris@1 { domain = 72; }
+node faces: rt_demo.faces@1 { domain = 72; }
+node meshes: rt_demo.meshes@1 { domain = 1; }
+node instances: rt_demo.instances@1 { domain = 1; }
+
+// Deliberately render at custom DRS resolution (320x180) inside a 640x360 window!
+node proj: rt_dyn.project_drs@1 {
+    verts <- verts.result;
+    lens_in <- lens.result;
+    taa_state <- taa_state.result;
+    domain = 144;
+}
+
+node rast: native.rasterize@1 {
+    vertices <- proj.result;
+    triangles <- faces.result;
+    domain = vec2(320, 180);
+}
+
+node gtao: graph "../graphs/gtao_jitter.esn" {
+    surface <- rast.surface;
+    lens <- lens.result;
+    sun <- sun.result;
+    taa_state <- taa_state.result;
+    far = 200.0;
+}
+
+node rt_sh: graph "../graphs/rt_shadows.esn" {
+    surface <- rast.surface;
+    lens <- lens.result;
+    sun <- sun.result;
+    taa_state <- taa_state.result;
+    vertices <- verts.result;
+    triangles <- tris.result;
+    meshes <- meshes.result;
+    instances <- instances.result;
+    render_scale = 0.5;
+    far = 200.0;
+}
+
+node raw: rt_dyn.shade@1 {
+    surface <- rast.surface;
+    ao_map <- gtao.result;
+    rt_sh_hits <- rt_sh.hits;
+    rt_sh_dims <- rt_sh.dims;
+    lens_in <- lens.result;
+    sun_in <- sun.result;
+    taa_state <- taa_state.result;
+    gran_alb <- gran_alb.result;
+    gran_nrm <- gran_nrm.result;
+    domain = size(surface);
+}
+
+node no_vol: rt_cinema.vol_none@1 { domain = vec2(1, 1); }
+
+node finish: graph "../graphs/cinema_finish_dynamic.esn" {
+    hdr <- raw.hdr;
+    vol <- no_vol.result;
+    motion <- raw.motion;
+    lens <- lens.result;
+    taa_state <- taa_state.result;
+    far = 200.0;
+    exposure = 1.05;
+    encode_srgb = 1;
+}
+
+output result <- finish.result;

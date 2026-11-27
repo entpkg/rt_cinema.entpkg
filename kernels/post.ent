@@ -66,7 +66,9 @@ kernel rt_cinema.bright_pass@1 {
     }
 }
 
-// AgX filmic grade + near/far optical bokeh DOF + distance-faded sharpening + vignette & grain.
+// AgX / ACES filmic grade + near/far optical bokeh DOF + exposure-invariant distance-faded sharpening
+// + vignette, grain, optional shadow toe (`toe_power`), and IEC sRGB display encoding (`encode_srgb = 1`).
+// `tone_mode`: 0 = AgX (wide-latitude daylight/soft rolloff), 1 = ACES Filmic (UE5 high-contrast chiaroscuro).
 kernel rt_cinema.cinema_grade@1 {
     requires { field.read; field.write; }
     input hdr: Image;
@@ -84,6 +86,9 @@ kernel rt_cinema.cinema_grade@1 {
     param highlight_tint: Vec3 = vec3(1.03, 1.01, 0.96);
     param vignette: Float = 0.085;
     param grain: Float = 0.007;
+    param encode_srgb: Int = 0;
+    param tone_mode: Int = 0;
+    param toe_power: Float = 1.0;
     param far: Float = 265.0;
     output result: Image;
 
@@ -107,17 +112,25 @@ kernel rt_cinema.cinema_grade@1 {
         let blur_w = clamp(max(max(near_coc, fg_bleed), far_coc), 0.0, 0.90);
         let focused = mix(c_sharp.xyz, c_soft.xyz, blur_w);
 
+        // Sharpen in un-exposed HDR space matching `hdr` before adding bloom & exposure (exposure-invariant!)
+        let far_soft = 1.0 - smoothstep(42.0, 115.0, depth) * 0.78;
+        let crisp = tone_sharpened(hdr, q, focused, sharpen * (1.0 - blur_w) * far_soft);
+
         let uv_b = (q + 0.5) / ext * size(bloom);
         let b_col = rt_clean_hdr4(at_linear(bloom, uv_b), far).xyz;
 
-        let linear_hdr = (focused + b_col * bloom_amount) * exposure;
-        let far_soft = 1.0 - smoothstep(42.0, 115.0, depth) * 0.78;
-        let crisp = tone_sharpened(hdr, q, linear_hdr, sharpen * (1.0 - blur_w) * far_soft);
-        let mapped = agx(crisp);
+        let linear_hdr = (crisp + b_col * bloom_amount) * exposure;
+        let mapped0 = if tone_mode == 1 { aces(linear_hdr) } else { agx(linear_hdr) };
+        let mapped = if abs(toe_power - 1.0) > 0.001 {
+            saturate(pow(max(mapped0, vec3(0.0, 0.0, 0.0)), vec3(toe_power, toe_power, toe_power)) * mix(1.0, 1.08, saturate((toe_power - 1.0) * 10.0)))
+        } else {
+            mapped0
+        };
 
         let graded = tone_warmth(mapped, saturation, contrast, shadow_tint, highlight_tint);
-        let vig = 1.0 - clamp(dot(ndc, ndc) * vignette, 0.0, 0.24);
+        let vig = 1.0 - clamp(dot(ndc, ndc) * vignette, 0.0, 0.48);
+        let display = if encode_srgb != 0 { linear_to_srgb(saturate(graded * vig)) } else { saturate(graded * vig) };
         let g = (interleaved_noise(q) - 0.5) * grain;
-        return vec4(saturate(graded * vig + g), 1.0);
+        return vec4(saturate(display + g), 1.0);
     }
 }
